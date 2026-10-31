@@ -3,13 +3,13 @@
 
 Why: Google Fonts is unreliable in mainland China, so every font is served
 from /assets/fonts. The Chinese serif (Noto Serif SC) is subset to exactly
-the characters that appear in index.html, which keeps it small.
+the characters that appear in index.html and main.js, which keeps it small.
 
-Re-run this whenever Chinese copy in index.html changes:
+Re-run this whenever Chinese copy in index.html or main.js changes:
 
     pip install fonttools brotli
     mkdir -p /tmp/sv-fonts && cd /tmp/sv-fonts
-    npm pack @fontsource/noto-serif-sc @fontsource-variable/source-serif-4 @fontsource/ibm-plex-mono
+    npm pack @fontsource/noto-serif-sc @fontsource-variable/source-serif-4 @fontsource-variable/jost @fontsource/ibm-plex-mono
     for f in *.tgz; do mkdir -p "${f%.tgz}" && tar -xzf "$f" -C "${f%.tgz}"; done
     cd -  # back to the repo
     python3 scripts/build-fonts.py /tmp/sv-fonts
@@ -27,7 +27,7 @@ from fontTools.ttLib import TTFont
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 OUT = os.path.join(ROOT, "assets", "fonts")
-SOURCES = [os.path.join(ROOT, "index.html")]
+SOURCES = [os.path.join(ROOT, "index.html"), os.path.join(ROOT, "assets", "js", "main.js")]
 
 CJK = re.compile(r"[　-〿㐀-䶿一-鿿＀-￯]")
 LATIN_UNICODES = (
@@ -110,6 +110,20 @@ def build_latin_serif(src, style):
     return out
 
 
+def build_jost(src):
+    files = pkg_dir(src, "variable-jost")
+    font = TTFont(os.path.join(files, "jost-latin-wght-normal.woff2"))
+    opts = subset_options()
+    opts.flavor = "woff2"
+    sub = subset.Subsetter(options=opts)
+    sub.populate(unicodes=subset.parse_unicodes(LATIN_UNICODES))
+    sub.subset(font)
+    font.flavor = "woff2"
+    out = os.path.join(OUT, "jost-latin-var.woff2")
+    font.save(out)
+    return out
+
+
 def copy_mono(src, weight):
     files = pkg_dir(src, "ibm-plex-mono")
     out = os.path.join(OUT, f"ibm-plex-mono-latin-{weight}.woff2")
@@ -128,6 +142,7 @@ def main():
         build_noto_serif_sc(src, 600, text),
         build_latin_serif(src, "normal"),
         build_latin_serif(src, "italic"),
+        build_jost(src),
         copy_mono(src, 400),
         copy_mono(src, 500),
     ]
