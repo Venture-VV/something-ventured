@@ -1136,7 +1136,7 @@ const ACTIONS = {
     const args = v === 'real' ? { action: 'real' } : v.startsWith('+') ? { action: 'plus', minutes: Number(v.slice(1)) } : { action: 'set', hhmm: v };
     try {
       const r = await call('demo.clock', args);
-      toast(`演示时钟 → ${fmt.time(r.now)} · ${MODE_ZH[r.mode]}`);
+      toast(`演示时钟 → ${fmt.md(r.now)} ${fmt.dow(r.now)} ${fmt.time(r.now)} · ${MODE_ZH[r.mode]}`);
       await syncClock();
       await load(false);
       loadBadges();

@@ -5,10 +5,10 @@
 | | 地址 | 是什么 |
 | --- | --- | --- |
 | 官网 | `/` | 俱乐部官网：一部「六章的电影」 |
-| **会员端 Web App** | `/app/` | 可以「添加到主屏幕」的会员 App（PWA）：钥匙入场、节目、预订、藏书、推荐、按铃 |
-| **管理后台** | `/admin/` | 前台与运营后台：入场核验、入会申请、会员、节目、预订、藏书、礼宾、公告、楼层 |
+| **会员端 Web App** | `/app/` | library live 的会员 App（PWA，可「添加到主屏幕」）：非会员看到一座图书馆，会员看到它的机器层（ASCII 终端）。按分区订座、白天签到与座谈、会员卡、隐藏内容 |
+| **管理后台** | `/admin/` | 门店后台：确认订单并安排桌号、座位图、入场核验、会员与入会审核、邀请函、会员时间、活动、内容分层、账目、操作日志、规则 |
 
-三者都是纯 HTML / CSS / JS，**没有任何依赖、没有构建步骤、不加载任何境外 CDN**（字体全部自托管），在大陆网络和微信内置浏览器里都能打开。会员端和后台共用一套数据与业务规则（`shared/core.js`），由一个零依赖的 Node 小服务器提供 API。
+三者都是纯 HTML / CSS / JS，**没有任何依赖、没有构建步骤、不加载任何境外 CDN**（字体全部自托管），在大陆网络和微信内置浏览器里都能打开。会员端和后台共用一套数据与业务规则（`shared/core.js`，依据《执行规格 v0.3》与 v0.3 新规则），由一个零依赖的 Node 小服务器提供 API。
 
 ## 快速开始
 
@@ -24,15 +24,15 @@ npm start
 
 | 演示账号 | 怎么进 |
 | --- | --- |
-| 会员 林知远 No.0007 | 会员端 →「我是会员」→「演示会员」，或手机号 `138 0000 0007` + 验证码 `2026` |
-| 申请人 宋予安（尽调中） | 「演示申请人」，或 `139 0000 0021` + `2026` |
-| 后台员工 | 任选一位，PIN `1215` |
+| 会员 林知远 No.0007 | 会员端「登录」页点「会员 林知远」，或手机号 `138 0000 0007` + 验证码 `2026` |
+| 非会员、审核中、待补资料、待付款、受邀人、已到期 | 同一页的演示身份；手机号见 [docs/web-app.md](docs/web-app.md#演示身份) |
+| 后台员工 | 周行（店长）或前台，PIN `1215` |
 
-数据存在 `server/data/db.json`，`npm run reset` 恢复初始数据（后台侧栏也有「重置演示」）。`npm test` 跑一遍核心流程的冒烟测试。
+会员端「我的」和后台「规则与设置」里有**演示时钟**（全站同步），可以让 19:00 的日夜切换随时发生。数据存在 `server/data/db.json`，`npm run reset` 恢复初始数据（后台也有「重置演示数据」）。`npm test` 跑 38 个验收用例。
 
 **没有服务器也能看**：把整个仓库放到任意静态托管上（或 `python3 -m http.server`），会员端和后台会自动切到「本地演示模式」，同一套规则在浏览器里运行，数据存在本机；同一浏览器里打开两个标签页，彼此实时同步。
 
-会员端与后台的完整说明（功能清单、架构、数据模型、接口、添加到主屏幕、上线清单、和小程序的关系）见 **[docs/web-app.md](docs/web-app.md)**。
+会员端与后台的完整说明（设计、功能、与执行规格的差异、十分钟演示脚本、部署、待定事项）见 **[docs/web-app.md](docs/web-app.md)**。
 
 ---
 
@@ -95,15 +95,17 @@ assets/js/main.js        官网：场景、翻页牌、礼宾台、表单与会�
 assets/js/sound.js       官网：配乐与音效（Web Audio）
 assets/fonts/            自托管字体（官网与会员端共用）
 assets/img/              分享图与图标
-app/                     会员端 Web App（PWA）：index.html、app.css、app.js、manifest、service worker、图标
+app/                     会员端 Web App（PWA）：index.html、app.css、app.js、ascii.js（字符动画）、manifest、service worker、图标
 admin/                   管理后台：index.html、admin.css、admin.js
 shared/core.js           数据模型、演示数据与全部业务规则（服务器与浏览器共用）
+shared/plan.js           店内平面图：分区、桌位，画成墨线 SVG 或纯 ASCII
+shared/plan.css          墨线平面图的样式（会员端与后台共用）
 shared/api.js            前端调用层：服务器模式 / 本地演示模式 / 离线
 shared/ui.js             模板、日期（杭州时间）、提示
 server/server.js         零依赖 Node 服务器：静态文件 + /api + 实时推送（SSE）
 scripts/build-fonts.py   重新生成字体子集（官网；--app 生成会员端与后台的子集）
 scripts/build-icons.mjs  渲染会员端图标与 iOS 启动图（需要 Playwright）
-scripts/smoke.mjs        核心流程冒烟测试（npm test）
+scripts/smoke.mjs        验收用例（npm test）
 docs/web-app.md          会员端与后台说明
 ```
 
@@ -125,7 +127,7 @@ mkdir -p /tmp/sv-fonts && (cd /tmp/sv-fonts && npm pack @fontsource/noto-serif-s
 python3 scripts/build-fonts.py /tmp/sv-fonts
 ```
 
-会员端和后台的中文标题用另一份子集（`noto-serif-sc-600-app.woff2`），改了 `app/`、`admin/` 里的中文标题后运行：
+会员端和后台的中文标题用另一份子集（`noto-serif-sc-600-app.woff2`），改了 `app/`、`admin/`、`shared/` 里的中文后运行：
 
 ```bash
 python3 scripts/build-fonts.py --app /tmp/sv-fonts

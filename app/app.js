@@ -861,7 +861,7 @@ const ACTIONS = {
   clock: async d => {
     const v = d.v;
     const args = v === 'real' ? { action: 'real' } : v.startsWith('+') ? { action: 'plus', minutes: Number(v.slice(1)) } : { action: 'set', hhmm: v };
-    try { const r = await call('demo.clock', args); toast(`演示时钟 → ${fmt.time(r.now)} · ${r.mode}`); await refreshRoute(); } catch (e) { handleError(e); }
+    try { const r = await call('demo.clock', args); toast(`演示时钟 → ${fmt.md(r.now)} ${fmt.dow(r.now)} ${fmt.time(r.now)} · ${r.mode}`); await refreshRoute(); } catch (e) { handleError(e); }
   },
   phosphor: d => { store.set('sv.phosphor', d.v === 'amber' ? null : d.v); applySkin(); render(); },
   paper: d => { store.set('sv.paper', d.v === 'green' ? null : d.v); applySkin(); render(); },

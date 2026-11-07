@@ -7,7 +7,8 @@ the characters that appear in index.html and main.js, which keeps it small.
 
 Re-run this whenever Chinese copy in index.html or main.js changes.
 The member app and the back office get their own subset (noto-serif-sc-600-app.woff2),
-built from app/ and admin/ only:  python3 scripts/build-fonts.py --app /tmp/sv-fonts
+built from app/, admin/ and shared/ (copy, floor plan, demo data):
+    python3 scripts/build-fonts.py --app /tmp/sv-fonts
 
 
     pip install fonttools brotli
@@ -31,9 +32,9 @@ from fontTools.ttLib import TTFont
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 OUT = os.path.join(ROOT, "assets", "fonts")
 SOURCES = [os.path.join(ROOT, "index.html"), os.path.join(ROOT, "assets", "js", "main.js")]
-APP_SOURCES = [os.path.join(ROOT, p) for p in ("app/index.html", "app/app.js", "admin/index.html", "admin/admin.js", "shared/ui.js", "shared/core.js")]
-# shared/core.js also holds the seed data (names, descriptions); only its vocabulary goes into the subset
-CUT = {os.path.join(ROOT, "shared", "core.js"): "const STAFF = ["}
+APP_SOURCES = [os.path.join(ROOT, p) for p in ("app/index.html", "app/app.js", "admin/index.html", "admin/admin.js", "shared/ui.js", "shared/core.js", "shared/plan.js")]
+# shared/core.js includes the demo data too (names, programme, content): names and titles are set in the serif
+CUT = {}
 
 CJK = re.compile(r"[　-〿㐀-䶿一-鿿＀-￯]")
 LATIN_UNICODES = (

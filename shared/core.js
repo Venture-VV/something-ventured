@@ -1133,7 +1133,8 @@ function addSegment(ctx, u, source, extra = {}) {
   const { db, now } = ctx;
   const cur = activeSeg(db, u.id, now);
   const curEnd = cur ? segsOf(db, u.id).reduce((e, s) => (s.end_at > e ? s.end_at : e), cur.end_at) : null;
-  const start = curEnd ? Date.parse(curEnd) + 1000 : now;
+  // R-MEM-10: a gift starts on the day it is claimed; R-MEM-11: a paid month starts when the payment succeeds
+  const start = curEnd ? Date.parse(curEnd) + 1000 : source === 'gift' ? Date.parse(atHz(hzDate(now), '00:00')) : now;
   const months = source === 'gift' ? db.config.giftMonths : 1;
   const endDate = addMonths(curEnd ? hzDate(curEnd) : hzDate(now), months);
   if (!u.member_no) u.member_no = String(db.nextNo++).padStart(4, '0');
@@ -1599,7 +1600,8 @@ def('demo.clock', 'public', (ctx, { action, hhmm, minutes }) => {
   else if (action === 'plus') db.clock.offsetMs += (parseInt(minutes, 10) || 0) * MIN;
   else if (action === 'set') {
     if (!/^\d{2}:\d{2}$/.test(hhmm || '')) fail('时间格式 HH:MM');
-    const target = Date.parse(atHz(hzDate(ctx.now), hhmm));
+    let target = Date.parse(atHz(hzDate(ctx.now), hhmm));
+    if (target <= ctx.now) target += D; // the demo clock only moves forward: the next HH:MM
     db.clock.offsetMs = target - real;
   } else fail('未知操作');
   const now = real + db.clock.offsetMs;
