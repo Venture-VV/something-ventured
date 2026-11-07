@@ -9,11 +9,11 @@
    Offline mode · the app was last used against a server and the network is gone:
                   calls fail fast, and the app falls back to what it cached.
    ========================================================= */
-import { handle, seed, ApiError } from './core.js';
+import { handle, seed, sweep, ApiError, VERSION } from './core.js';
 
 export { ApiError };
 
-const LS_DB = 'sv.demo.db.v1';
+const LS_DB = 'sv.demo.db.v2';
 const LS_MODE = 'sv.demo.mode';
 const origin = Math.random().toString(36).slice(2);
 const listeners = new Set();
@@ -55,6 +55,12 @@ export async function connect(opts = {}) {
     mode = 'local';
     store.set(LS_MODE, 'local');
     addEventListener('storage', e => { if (e.key === LS_DB) emit(['all']); });
+    // local timers: payment locks, confirmation deadlines and refunds still expire with no server around
+    setInterval(() => {
+      const db = loadDb();
+      const changed = sweep(db, Date.now() + ((db.clock && db.clock.offsetMs) || 0));
+      if (changed.length) { saveDb(db); emit(changed); }
+    }, 10e3);
   }
   return mode;
 }
@@ -86,7 +92,7 @@ export async function call(method, args = {}) {
     try { data = await res.json(); } catch { /* not json */ }
     if (!res.ok || !data || data.error) {
       const e = (data && data.error) || {};
-      throw new ApiError(e.code || 'error', e.message || `请求失败（${res.status}）`, res.status);
+      throw new ApiError(e.code || 'error', e.message || `请求失败（${res.status}）`, res.status, e.rule || null);
     }
     return data.result;
   }
@@ -108,7 +114,7 @@ export async function call(method, args = {}) {
 function loadDb() {
   const raw = store.get(LS_DB);
   if (raw) {
-    try { const db = JSON.parse(raw); if (db && db.version === 1) return db; } catch { /* corrupted: reseed */ }
+    try { const db = JSON.parse(raw); if (db && db.version === VERSION) return db; } catch { /* corrupted: reseed */ }
   }
   if (!memoryDb) { memoryDb = seed(Date.now()); saveDb(memoryDb); }
   return memoryDb;

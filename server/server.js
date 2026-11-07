@@ -15,7 +15,7 @@ import zlib from 'node:zlib';
 import { createReadStream } from 'node:fs';
 import { readFile, writeFile, mkdir, rename, stat } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
-import { handle, seed, ApiError } from '../shared/core.js';
+import { handle, seed, sweep, ApiError, VERSION } from '../shared/core.js';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const DATA_DIR = process.env.SV_DATA_DIR || path.join(ROOT, 'server', 'data');
@@ -46,7 +46,7 @@ async function loadDb() {
   if (!process.argv.includes('--reset')) {
     try {
       const data = JSON.parse(await readFile(DB_FILE, 'utf8'));
-      if (data && data.version === 1) { db = data; return 'loaded'; }
+      if (data && data.version === VERSION) { db = data; return 'loaded'; }
     } catch { /* first run */ }
   }
   db = seed(Date.now());
@@ -121,11 +121,18 @@ async function api(req, res, method) {
     }
     json(res, 200, { result });
   } catch (err) {
-    if (err instanceof ApiError) return json(res, err.status, { error: { code: err.code, message: err.message } });
+    if (err instanceof ApiError) return json(res, err.status, { error: { code: err.code, message: err.message, rule: err.rule || null } });
     console.error(err);
     json(res, 500, { error: { code: 'internal', message: '服务器出了点问题' } });
   }
 }
+
+/* timers that must fire even when nobody calls: payment locks, 30-minute confirmations, refunds (spec 12.2) */
+setInterval(() => {
+  if (!db) return;
+  const changed = sweep(db, Date.now() + ((db.clock && db.clock.offsetMs) || 0));
+  if (changed.length) { persistSoon(); broadcast(changed.filter(t => t !== 'session'), 'timer'); }
+}, 10e3).unref();
 
 /* ---------- static files ---------- */
 async function serveStatic(req, res, pathname) {

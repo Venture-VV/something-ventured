@@ -1,90 +1,119 @@
 /* =========================================================
-   Something Ventured · demo core
-   One module, two homes: the Node server (server/server.js)
-   and the browser's local demo mode (shared/api.js).
-   It holds the data model, the seed data and every business rule,
-   so both modes behave exactly the same.
-   ========================================================= */
+   sth.ventured · library live — demo core (v2)
+   Implements the 2026-11-05 PRD v0.1 and the AI spec v0.3, with the
+   later rule from the v0.3 human doc: seats are booked by zone (分区),
+   the store assigns the exact table (the v0.1 approach).
+   Rule IDs (R-*, INV-*, T*) refer to the AI spec; they also appear in
+   error responses so the UI can explain itself.
 
-export const OPENING = '2026-12-15';
-export const DEMO_CODE = '2026'; // SMS code accepted in the demo
-export const DEMO_PIN = '1215';  // staff PIN in the demo
-const H = 3600e3;
+   One module, two homes: the Node server (server/server.js) and the
+   browser's local demo mode (shared/api.js). Same rules either way.
+   Money is integer fen. Times are stored UTC; business time is Asia/Shanghai.
+   ========================================================= */
+import { ZONES, RESOURCES, zoneOf, resourceOf } from './plan.js';
+
+export const VERSION = 2;
+export const DEMO_CODE = '2026';
+export const DEMO_PIN = '1215';
+export const RULES_VERSION = 'v0.3';
+const MIN = 60e3;
+const H = 60 * MIN;
 const D = 24 * H;
 
+export const STORE = { id: 'll-hz-wulin9', brand: 'sth.ventured', name: 'library live', zh: '杭州 · 武林路 9 号' };
+
+export const DEFAULT_CONFIG = {
+  switchAt: '19:00', dayOpenAt: '10:00', nightCloseAt: '02:00',
+  windowMember: 7, windowGuest: 3,
+  onlineCutoff: '21:30', showStart: '21:00', holdDeadline: '21:30',
+  lockMinutes: 10, confirmMinutes: 30, maxResources: 3,
+  depositRatio: 0.3,
+  prices: { S: { member: 200000, guest: 400000 }, A: { member: 150000, guest: 300000 }, B: { member: 120000, guest: 240000 } },
+  ticketPrice: 18800, ticketDrink: '一杯特调', ticketLimit: 4, ticketCompanions: 3, ticketSalesEnabled: true,
+  memberPrice: 102400, giftMonths: 3, giftClaimDeadline: '2027-01-15', renewWithoutReviewDays: 30,
+  reservedCount: 2,
+  // [禁止自定]: off until the owner decides (Q-10, Q-13, Q-16)
+  userWithdrawEnabled: false, userCancelPolicy: 'disabled', membershipRefund: 'none',
+  refundSettleSeconds: 20, // mock payment channel: refunds land after this many seconds
+};
+const LOCKED_CONFIG = { userWithdrawEnabled: 'Q-16', userCancelPolicy: 'Q-10', membershipRefund: 'Q-13' };
+
 /* ---------- vocabulary ---------- */
-export const SECTORS = [
-  { id: 'AI', en: 'AI', zh: '人工智能' },
-  { id: 'VC', en: 'VC', zh: '风险投资' },
-  { id: 'Robotics', en: 'Robotics', zh: '机器人' },
-  { id: 'Frontier', en: 'Other frontier', zh: '其他前沿' },
-];
-export const sectorOf = id => SECTORS.find(s => s.id === id) || SECTORS[3];
-export const BASES = ['杭州', '上海', '深圳', '北京', '其他'];
-
-/* Internal pipeline. `step` is where the applicant sits on the public path. */
-export const STAGES = [
-  { id: 'received', en: 'Received', zh: '新申请', step: 1 },
-  { id: 'diligence', en: 'In diligence', zh: '尽调中', step: 1 },
-  { id: 'initiation', en: 'Initiation', zh: '入会仪式', step: 2 },
-  { id: 'welcomed', en: 'Welcomed', zh: '已入会', step: 3 },
-  { id: 'declined', en: 'Declined', zh: '婉拒', step: -1 },
-];
-export const stageOf = id => STAGES.find(s => s.id === id) || STAGES[0];
-export const PATH = [
-  { en: 'Referral', zh: '推荐' },
-  { en: 'Screening', zh: '筛选' },
-  { en: 'Initiation', zh: '入会仪式' },
-  { en: 'Welcome', zh: '欢迎' },
-];
-
-export const EVENT_TYPES = {
-  'closed-door': { en: 'Closed-door session', zh: '闭门分享' },
-  podcast: { en: 'Live taping', zh: '播客录制' },
-  reading: { en: 'Reading room', zh: '读书会' },
-  unplugged: { en: 'Unplugged', zh: '不插电' },
-  supper: { en: 'Members’ supper', zh: '会员晚宴' },
-  house: { en: 'House night', zh: '俱乐部之夜' },
+export const IDENTITIES = {
+  guest: { zh: '游客', en: 'Guest' },
+  non_member: { zh: '非会员', en: 'Non-member' },
+  applicant: { zh: '审核中', en: 'Applicant' },
+  invitee: { zh: '受邀', en: 'Invitee' },
+  member_active: { zh: '会员', en: 'Member' },
+  member_expired: { zh: '会员已到期', en: 'Expired' },
 };
-export const COLORS = ['pink', 'powder', 'mint', 'mustard', 'lav', 'rasp'];
-
-export const SESSIONS = {
-  day: { id: 'day', en: 'Day · Members only', zh: '白天 · 会员时段', hours: '10:00 – 18:00', from: '10:00' },
-  night: { id: 'night', en: 'Night · Open to all', zh: '夜晚 · 对外开放', hours: '18:00 – 01:00', from: '18:00' },
+/* booking statuses, worded like a deal (an idea from the v0.3 doc that echoes the website's 尽调中 stamp) */
+export const BOOKING_STATUS = {
+  pending_payment: { zh: '待支付', deal: 'Term sheet', note: '10 分钟内完成支付' },
+  payment_expired: { zh: '已取消（超时未付）', deal: 'Lapsed' },
+  pending_confirm: { zh: '待门店确认', deal: '尽调中', note: '门店 30 分钟内确认' },
+  confirmed: { zh: '预订成功', deal: '已交割' },
+  rejected: { zh: '门店未接受', deal: '本轮未进' },
+  confirm_timeout_closed: { zh: '确认超时，已关闭', deal: '本轮未进' },
+  cancelled: { zh: '已取消', deal: 'Withdrawn' },
+  fulfilled: { zh: '已到店', deal: 'Closed' },
+  no_show: { zh: '未到店', deal: 'No show' },
 };
-
-export const REQUEST_TYPES = {
-  table: { en: 'A seat', zh: '订位协助' },
-  guest: { en: 'Bringing a guest', zh: '携友到访' },
-  room: { en: 'Private study', zh: '私人书房' },
-  book: { en: 'Find a book', zh: '找一本书' },
-  other: { en: 'Something else', zh: '其他' },
+export const APP_STATUS = {
+  under_review: { zh: '审核中', en: 'Under review' },
+  need_info: { zh: '待补充资料', en: 'Need info' },
+  approved_awaiting_payment: { zh: '已通过 · 待付款', en: 'Approved' },
+  rejected: { zh: '未通过', en: 'Declined' },
+  completed: { zh: '已入会', en: 'Completed' },
 };
-
-export const CITIES = [
-  { id: 'HZ', en: 'Hangzhou', zh: '杭州', note: '12.15' },
-  { id: 'SH', en: 'Shanghai', zh: '上海', note: 'Coming' },
-  { id: 'SZ', en: 'Shenzhen', zh: '深圳', note: 'Coming' },
-  { id: 'BJ', en: 'Beijing', zh: '北京', note: 'Coming' },
+export const EVENT_KINDS = {
+  panel: { zh: '闭门分享', en: 'Panel' },
+  podcast: { zh: '播客录制', en: 'Live podcast' },
+  roundtable: { zh: '开放座谈', en: 'Roundtable' },
+  maker: { zh: '创客', en: 'Maker' },
+};
+export const STAFF = [
+  { id: 'st1', name: '周行', role: 'admin', title: '店长' },
+  { id: 'st2', name: '沈岚', role: 'reception', title: '前台' },
+  { id: 'st3', name: '何夕', role: 'reception', title: '前台' },
 ];
 
-/* ---------- time: everything is shown in Hangzhou time (UTC+8) ---------- */
+/* ---------- time: business time is Hangzhou (UTC+8) ---------- */
 export function hz(t = Date.now()) {
   const d = new Date(+new Date(t) + 8 * H);
-  return {
-    y: d.getUTCFullYear(), m: d.getUTCMonth() + 1, d: d.getUTCDate(),
-    h: d.getUTCHours(), mi: d.getUTCMinutes(), dow: d.getUTCDay(),
-    date: d.toISOString().slice(0, 10),
-  };
+  return { y: d.getUTCFullYear(), m: d.getUTCMonth() + 1, d: d.getUTCDate(), h: d.getUTCHours(), mi: d.getUTCMinutes(), dow: d.getUTCDay(), date: d.toISOString().slice(0, 10) };
 }
 export const hzDate = t => hz(t).date;
-export const atHz = (date, hhmm = '00:00') => new Date(`${date}T${hhmm}:00+08:00`).toISOString();
+export const atHz = (date, hhmm = '00:00') => new Date(`${date}T${hhmm.length === 5 ? hhmm + ':00' : hhmm}+08:00`).toISOString();
 export const addDays = (date, n) => new Date(Date.parse(`${date}T00:00:00Z`) + n * D).toISOString().slice(0, 10);
 export const daysBetween = (a, b) => Math.round((Date.parse(`${b}T00:00:00Z`) - Date.parse(`${a}T00:00:00Z`)) / D);
 const iso = t => new Date(t).toISOString();
+const mins = hhmm => { const [h, m] = hhmm.split(':').map(Number); return h * 60 + m; };
+export function addMonths(date, n) { // calendar month, same day, clamped to the month's end (R-MEM-12)
+  const [y, m, d] = date.split('-').map(Number);
+  const total = y * 12 + (m - 1) + n;
+  const ty = Math.floor(total / 12), tm = total % 12;
+  const last = new Date(Date.UTC(ty, tm + 1, 0)).getUTCDate();
+  return `${ty}-${String(tm + 1).padStart(2, '0')}-${String(Math.min(d, last)).padStart(2, '0')}`;
+}
 
-/* ---------- small utilities ---------- */
-export function hash53(str, seed = 0) { // cyrb53: fast, well-mixed, not cryptographic
+/* day / night / closed (R-DAY-01) and the business date "tonight" belongs to */
+export function modeAt(config, t) {
+  const x = hz(t);
+  const m = x.h * 60 + x.mi;
+  const open = mins(config.dayOpenAt), sw = mins(config.switchAt), close = mins(config.nightCloseAt);
+  if (m >= open && m < sw) return 'day';
+  if (m >= sw || m < close) return 'night';
+  return 'closed';
+}
+export function tonightDate(config, t) {
+  const x = hz(t);
+  return x.h * 60 + x.mi < mins(config.nightCloseAt) ? addDays(x.date, -1) : x.date;
+}
+const sessionEnd = (config, date) => Date.parse(atHz(addDays(date, 1), config.nightCloseAt));
+
+/* ---------- utilities ---------- */
+export function hash53(str, seed = 0) {
   let h1 = 0xdeadbeef ^ seed, h2 = 0x41c6ce57 ^ seed;
   for (let i = 0; i < str.length; i++) {
     const ch = str.charCodeAt(i);
@@ -95,26 +124,23 @@ export function hash53(str, seed = 0) { // cyrb53: fast, well-mixed, not cryptog
   h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^ Math.imul(h1 ^ (h1 >>> 13), 3266489909);
   return 4294967296 * (2097151 & h2) + (h1 >>> 0);
 }
-
-/* The door code on a member's key: six digits that turn over every 30 s.
-   Demo-grade (a production build would use TOTP with a server-held secret). */
+/* the rotating code on a member's card: proves the member is there in person (R-MEM-05). Demo-grade; production uses TOTP. */
 export const CODE_STEP = 30e3;
-export function entryCode(secret, t = Date.now(), offset = 0) {
-  const n = Math.floor(t / CODE_STEP) + offset;
-  return String(hash53(`${secret}:${n}`) % 1e6).padStart(6, '0');
+export function memberCode(secret, t = Date.now(), offset = 0) {
+  return String(hash53(`${secret}:${Math.floor(t / CODE_STEP) + offset}`) % 1e6).padStart(6, '0');
 }
-
+const CODESET = 'ACDEFHJKMNPRTUVWXY34679';
+function token(n, seed) {
+  if (seed != null) { let h = hash53(seed); return Array.from({ length: n }, () => { const c = CODESET[h % CODESET.length]; h = Math.floor(h / CODESET.length) || hash53(seed + c); return c; }).join(''); }
+  const a = new Uint8Array(n);
+  globalThis.crypto.getRandomValues(a);
+  return Array.from(a, b => CODESET[b % CODESET.length]).join('');
+}
 const ALPHA = '0123456789abcdefghijklmnopqrstuvwxyz';
 export function rid(n = 10) {
   const a = new Uint8Array(n);
   globalThis.crypto.getRandomValues(a);
   return Array.from(a, b => ALPHA[b % 36]).join('');
-}
-function inviteCode() {
-  const set = 'ACDEFHJKMNPRTUVWXY34679';
-  const a = new Uint8Array(4);
-  globalThis.crypto.getRandomValues(a);
-  return 'SV-' + Array.from(a, b => set[b % set.length]).join('');
 }
 function mulberry32(a) {
   return () => {
@@ -128,362 +154,468 @@ const clean = (v, max = 200) => String(v ?? '').replace(/\s+/g, ' ').trim().slic
 const cleanText = (v, max = 600) => String(v ?? '').replace(/\r/g, '').trim().slice(0, max);
 export const normPhone = v => String(v ?? '').replace(/[\s-]/g, '').replace(/^\+?86/, '');
 const byId = (list, id) => list.find(x => x.id === id);
+const fen = n => Math.round(n);
+export const yuan = f => `¥${(f / 100).toLocaleString('zh-CN', { maximumFractionDigits: 2 })}`;
 
 export class ApiError extends Error {
-  constructor(code, message, status = 400) { super(message); this.code = code; this.status = status; }
+  constructor(code, message, status = 400, rule = null) { super(message); this.code = code; this.status = status; this.rule = rule; }
 }
-const fail = (message, code = 'bad_request', status = 400) => { throw new ApiError(code, message, status); };
+const fail = (message, code = 'bad_request', status = 400, rule = null) => { throw new ApiError(code, message, status, rule); };
+const ruleFail = (rule, message) => fail(message, 'rule', 422, rule);
 
-/* ---------- floors ---------- */
-const LIBRARY_ZONES = [
-  { id: 'long', zh: '长桌阅览', en: 'The Long Table', capacity: 16, unit: 'seat', note: '中央长桌，十六盏绿罩台灯。' },
-  { id: 'fireside', zh: '壁炉沙发', en: 'Fireside', capacity: 8, unit: 'seat', note: '壁炉两侧的对称沙发，适合两三人小叙。' },
-  { id: 'listening', zh: '唱片角', en: 'Listening Corner', capacity: 6, unit: 'seat', note: '黑胶与耳机，靠近不插电小舞台。' },
-  { id: 'study', zh: '小书房', en: 'Private Study', capacity: 2, unit: 'room', note: '两间可关门的小书房，最多四人。' },
-];
-
-/* What a floor is doing right now: planned / opening soon / day / night / closed. */
-export function floorState(f, t = Date.now()) {
-  const now = hz(t);
-  if (f.status === 'planned') return { key: 'planned', en: 'Planned', zh: '规划中' };
-  if (f.status === 'closed') return { key: 'closed', en: 'Closed today', zh: '今日休息' };
-  if (f.status === 'preopening') {
-    const days = Math.max(0, daysBetween(now.date, f.openingDate || OPENING));
-    return { key: 'soon', en: 'Opening soon', zh: days ? `距开业 ${days} 天` : '今日开业', days };
+/* the daily check-in code and its "library date stamp" (R-DAY-04) */
+export function checkinCode(db, date) {
+  return (db.checkinOverrides && db.checkinOverrides[date]) || token(4, `${db.secret}:checkin:${date}`);
+}
+export function stampPattern(code) { // a 7x7 mirrored pattern, one per code, like a library's date stamp
+  let h = hash53(`stamp:${code}`);
+  const rows = [];
+  for (let y = 0; y < 7; y++) {
+    const half = [];
+    for (let x = 0; x < 4; x++) { half.push(h & 1); h = Math.floor(h / 2) || hash53(code + y + x); }
+    rows.push([...half, ...half.slice(0, 3).reverse()]);
   }
-  let mode = f.mode && f.mode !== 'auto' ? f.mode : null;
-  if (!mode) mode = now.h >= 10 && now.h < 18 ? 'day' : (now.h >= 18 || now.h < 1) ? 'night' : 'closed';
-  if (mode === 'day') return { key: 'day', en: 'Day · Members only', zh: '白天 · 仅限会员' };
-  if (mode === 'night') return { key: 'night', en: 'Night · Open to all', zh: '夜晚 · 对外开放' };
-  return { key: 'closed', en: 'Closed until 10:00', zh: '休息中 · 10:00 开门' };
-}
-
-function bookingWindow(db, t) {
-  const lib = byId(db.floors, 'library');
-  const today = hzDate(t);
-  const start = lib.openingDate && lib.openingDate > today ? lib.openingDate : today;
-  return Array.from({ length: 14 }, (_, i) => addDays(start, i));
+  return rows;
 }
 
 /* =========================================================
    Seed
    ========================================================= */
-const STAFF = [
-  { id: 's1', name: '沈岚', en: 'Shen Lan', role: '会员服务', roleEn: 'Host', host: true },
-  { id: 's2', name: '何夕', en: 'He Xi', role: '会员服务', roleEn: 'Host', host: true },
-  { id: 's3', name: '周行', en: 'Zhou Xing', role: '店长', roleEn: 'House Manager', host: false },
-  { id: 's4', name: '陆一苇', en: 'Lu Yiwei', role: '图书管理员', roleEn: 'Librarian', host: false },
-];
-
-// name, english, venture, sector, base, days since joining
 const MEMBERS = [
-  ['周以宁', 'Zhou Yining', '格物资本 · 管理合伙人', 'VC', '杭州', 72],
-  ['陈牧之', 'Chen Muzhi', '灵枢智能 · 创始人', 'AI', '杭州', 70],
-  ['许嘉禾', 'Xu Jiahe', '北辰创投 · 合伙人', 'VC', '上海', 68],
-  ['苏砚', 'Su Yan', '零度具身 · 联合创始人', 'Robotics', '杭州', 66],
-  ['顾言', 'Gu Yan', '微光模型 · 首席科学家', 'AI', '北京', 63],
-  ['叶闻舟', 'Ye Wenzhou', '千帆机器人 · CTO', 'Robotics', '深圳', 61],
-  ['林知远', 'Lin Zhiyuan', '远望机器人 · 创始人', 'Robotics', '杭州', 60],
-  ['江念', 'Jiang Nian', '镶嵌资本 · 投资总监', 'VC', '上海', 55],
-  ['宋清和', 'Song Qinghe', '栖木智能 · 产品负责人', 'AI', '杭州', 52],
-  ['陆星河', 'Lu Xinghe', '星河动力 · 创始人', 'Frontier', '杭州', 49],
-  ['韩一诺', 'Han Yinuo', '一诺资本 · 合伙人', 'VC', '北京', 46],
-  ['程溪', 'Cheng Xi', '溪流模型 · 研究员', 'AI', '杭州', 44],
-  ['方既白', 'Fang Jibai', '既白生物 · 创始人', 'Frontier', '上海', 41],
-  ['季长风', 'Ji Changfeng', '长风机器人 · 工程副总裁', 'Robotics', '杭州', 38],
-  ['唐晚', 'Tang Wan', '晚照创投 · 投资副总裁', 'VC', '杭州', 35],
-  ['温屿', 'Wen Yu', '屿光智能 · 创始人', 'AI', '深圳', 31],
-  ['傅辰', 'Fu Chen', '辰星具身 · CEO', 'Robotics', '杭州', 27],
-  ['夏知秋', 'Xia Zhiqiu', '知秋资本 · 合伙人', 'VC', '上海', 24],
-  ['孟川', 'Meng Chuan', '川流智能 · 联合创始人', 'AI', '杭州', 20],
-  ['蒋南星', 'Jiang Nanxing', '南星传感 · 创始人', 'Robotics', '深圳', 16],
-  ['邵允', 'Shao Yun', '弧光种子基金 · 投资人', 'VC', '杭州', 12],
-  ['白露', 'Bai Lu', '白露智能 · 算法负责人', 'AI', '杭州', 8],
-  ['秦朗', 'Qin Lang', '朗月机器人 · 联合创始人', 'Robotics', '北京', 4],
-  ['何以安', 'He Yian', '安然智能 · 创始人', 'AI', '杭州', 2],
+  ['周以宁', 'Zhou Yining', '格物资本 · 管理合伙人', '杭州'],
+  ['陈牧之', 'Chen Muzhi', '灵枢智能 · 创始人', '杭州'],
+  ['许嘉禾', 'Xu Jiahe', '北辰创投 · 合伙人', '上海'],
+  ['苏砚', 'Su Yan', '零度具身 · 联合创始人', '杭州'],
+  ['顾言', 'Gu Yan', '微光模型 · 首席科学家', '北京'],
+  ['叶闻舟', 'Ye Wenzhou', '千帆机器人 · CTO', '深圳'],
+  ['林知远', 'Lin Zhiyuan', '远望机器人 · 创始人', '杭州'],
+  ['江念', 'Jiang Nian', '镶嵌资本 · 投资总监', '上海'],
+  ['宋清和', 'Song Qinghe', '栖木智能 · 产品负责人', '杭州'],
+  ['陆星河', 'Lu Xinghe', '星河动力 · 创始人', '杭州'],
+  ['韩一诺', 'Han Yinuo', '一诺资本 · 合伙人', '北京'],
+  ['程溪', 'Cheng Xi', '溪流模型 · 研究员', '杭州'],
+  ['方既白', 'Fang Jibai', '既白生物 · 创始人', '上海'],
+  ['季长风', 'Ji Changfeng', '长风机器人 · 工程副总裁', '杭州'],
+  ['唐晚', 'Tang Wan', '晚照创投 · 投资副总裁', '杭州'],
+  ['温屿', 'Wen Yu', '屿光智能 · 创始人', '深圳'],
+  ['傅辰', 'Fu Chen', '辰星具身 · CEO', '杭州'],
+  ['夏知秋', 'Xia Zhiqiu', '知秋资本 · 合伙人', '上海'],
+  ['孟川', 'Meng Chuan', '川流智能 · 联合创始人', '杭州'],
+  ['白露', 'Bai Lu', '白露智能 · 算法负责人', '杭州'],
 ];
+const SHOWS = [
+  ['不插电之夜', 'Unplugged Night', '林间四重奏'],
+  ['书架间的爵士', 'Jazz in the Stacks', 'Kepler Trio'],
+  ['合成器与电路', 'Synth & Circuits', 'Analog Hearts'],
+  ['城市民谣', 'City Folk', '雾港乐队'],
+  ['深夜钢琴', 'Late Night Piano', 'Ellis 钢琴独奏'],
+  ['巴萨诺瓦与书', 'Bossa & Books', 'Nova Bossa'],
+  ['后摇之夜', 'Post-rock Night', '回声定位'],
+];
+export const BOOKS = [
+  ['k1', 'The Power Law', 'Sebastian Mallaby'], ['k2', '从 0 到 1', '彼得·蒂尔'], ['k3', '芯片战争', '克里斯·米勒'],
+  ['k4', 'The Soul of a New Machine', 'Tracy Kidder'], ['k5', '哥德尔、艾舍尔、巴赫', '侯世达'], ['k6', 'The Dream Machine', 'M. Mitchell Waldrop'],
+  ['k7', '创新者', '沃尔特·艾萨克森'], ['k8', 'Troublemakers', 'Leslie Berlin'], ['k9', '人月神话', '弗雷德里克·布鲁克斯'], ['k10', '控制论', '诺伯特·维纳'],
+].map(([id, title, author]) => ({ id, title, author }));
 
-const THESES = [
-  '具身智能的数据飞轮：谁先拿到真实世界的数据，谁就先跑出来。',
-  '小模型 + 垂直数据，会在企业里替代掉一半的 SaaS。',
-  '机器人会先在没人愿意干的岗位上落地，而不是在家里。',
-  '下一代基金会更小、更专注，像工作室一样运作。',
-  'AI 原生的公司，组织结构会更像一支乐队。',
-  '传感器是被低估的那一层：触觉会是下一个视觉。',
-];
-
-// name, english, venture, sector, base, lead, phone, stage, days ago, extra
-const APPLICANTS = [
-  ['向南', 'Xiang Nan', '具身未来 · 创始人', 'Robotics', '杭州', 7, '13900000011', 'received', 1, { source: 'nomination', invite: 'SV-7K2Q', completed: false }],
-  ['罗思齐', 'Luo Siqi', '思齐量化 · 合伙人', 'VC', '上海', 8, '13900000012', 'received', 2],
-  ['金雨桐', 'Jin Yutong', '桐语智能 · CEO', 'AI', '杭州', null, '13900000013', 'received', 3],
-  ['杜若', 'Du Ruo', '若木实验室 · 研究员', 'Frontier', '北京', 5, '13900000014', 'received', 5],
-  ['宋予安', 'Song Yuan', '予安智能 · 创始人', 'AI', '杭州', 2, '13900000021', 'diligence', 9],
-  ['邱白', 'Qiu Bai', '白杨资本 · 投资经理', 'VC', '深圳', 6, '13900000022', 'diligence', 12],
-  ['冯远山', 'Feng Yuanshan', '远山动力 · CTO', 'Robotics', '杭州', 4, '13900000023', 'diligence', 14],
-  ['黎昕', 'Li Xin', '昕辰模型 · 研究员', 'AI', '上海', 3, '13900000024', 'diligence', 16],
-  ['钟灵', 'Zhong Ling', '灵犀机器人 · 创始人', 'Robotics', '杭州', 7, '13900000031', 'initiation', 19, { initiationAt: atHz('2026-12-14', '16:00') }],
-  ['庄晓', 'Zhuang Xiao', '晓峰资本 · 合伙人', 'VC', '杭州', 1, '13900000032', 'initiation', 22, { initiationAt: atHz('2026-12-14', '16:30') }],
-  ['马骁', 'Ma Xiao', '骁腾科技 · 销售总监', 'Frontier', '其他', null, '13900000041', 'declined', 20],
-  ['吴迪', 'Wu Di', '迪恩咨询 · 顾问', 'Frontier', '上海', null, '13900000042', 'declined', 26],
-];
-
-const EVENTS = [
-  ['e01', '筹备处开放日', 'Preview Room Open House', 'house', '2026-10-24', '15:00', '18:00', '筹备处 · 杭州', 40, 'mustard',
-    '在 Library 开门之前，先在筹备处见一面：看看图纸、摸摸书脊、认一认彼此。', '周行', []],
-  ['e02', '闭门分享：机器人的手', 'Closed-door: The Robot’s Hand', 'closed-door', '2026-11-05', '19:30', '21:30', '筹备处 · 杭州', 20, 'powder',
-    '灵巧手为什么这么难？三位一线工程师，讲他们拆坏过的东西。不录音，不外传。', '沈岚', ['季长风', '叶闻舟']],
-  ['e03', '创始会员之夜', 'Founders’ Evening', 'supper', '2026-11-21', '19:00', '22:00', '筹备处 · 杭州', 30, 'pink',
-    '第一批会员的晚餐。没有致辞，没有 PPT，只有一张长桌和一份手写菜单。', '周以宁', []],
-  ['e04', '闭门分享：具身智能的下一个十年', 'Embodied AI, the Next Decade', 'closed-door', '2026-11-28', '19:30', '21:30', '筹备处 · 杭州', 20, 'mint',
-    '数据、硬件、商业化，哪一个会先成为瓶颈？两位创始人与一位投资人的闭门对谈。', '沈岚', ['苏砚', '傅辰', '周以宁']],
-  ['e05', '视频播客现场录制 · 第 01 期', 'Live Taping, Episode 01', 'podcast', '2026-12-05', '15:00', '17:00', '筹备处 · 杭州', 36, 'lav',
-    '《Something Ventured》第一期：谁在给机器人下注？现场观众可以提问，问题会被剪进正片。', '何夕', ['许嘉禾', '陈牧之']],
-  ['e06', '开业前夜 · 会员预览', 'Opening Eve, a Members’ Preview', 'house', '2026-12-14', '19:00', '22:00', '3F Library · 杭州', 60, 'rasp',
-    '开门前一晚，Library 只为会员亮灯。第一张借书卡，在这一晚盖章。', '周行', []],
-  ['e07', '开业之夜 · 不插电', 'Opening Night, Unplugged', 'unplugged', '2026-12-15', '20:00', '23:00', '3F Library · 杭州', 48, 'mustard',
-    '开业当晚向公众开放。前排四十八个座位为会员保留，弦乐四重奏 + 一把木吉他。', '何夕', []],
-  ['e08', '读书会：《The Power Law》', 'Reading Room: The Power Law', 'reading', '2026-12-19', '15:00', '17:00', '3F Library · 长桌', 16, 'powder',
-    '一本关于风险投资如何改变世界的书。读完前三章即可参加，书可在 Library 现场借阅。', '陆一苇', []],
-  ['e09', '闭门分享：AI 原生公司的组织', 'Closed-door: The AI-native Firm', 'closed-door', '2026-12-26', '19:30', '21:30', '3F Library · 小书房', 24, 'mint',
-    '当一半的工作由模型完成，一家公司还需要几个人？两位 CEO 分享他们的组织实验。', '沈岚', ['孟川', '温屿']],
-  ['e10', '跨城市 · 上海会员晚餐', 'Cross-city: A Shanghai Supper', 'supper', '2027-01-09', '19:00', '22:00', '上海 · 地点待定', 20, 'pink',
-    '上海的会员们的第一次聚会。地点确定后通知。', '何夕', [], 'draft'],
-];
-
-const BOOKS = [
-  ['The Power Law', 'Sebastian Mallaby', 'en', 'A-01', 'rasp'],
-  ['从 0 到 1', '彼得·蒂尔', 'zh', 'A-02', 'mustard'],
-  ['创新者', '沃尔特·艾萨克森', 'zh', 'A-03', 'powder'],
-  ['芯片战争', '克里斯·米勒', 'zh', 'A-04', 'ink'],
-  ['The Soul of a New Machine', 'Tracy Kidder', 'en', 'A-05', 'mint'],
-  ['只有偏执狂才能生存', '安迪·格鲁夫', 'zh', 'A-06', 'pink'],
-  ['创业维艰', '本·霍洛维茨', 'zh', 'A-07', 'lav'],
-  ['哥德尔、艾舍尔、巴赫', '侯世达', 'zh', 'B-01', 'mustard'],
-  ['The Dream Machine', 'M. Mitchell Waldrop', 'en', 'B-02', 'powder'],
-  ['生命 3.0', '迈克斯·泰格马克', 'zh', 'B-03', 'rasp'],
-  ['The Alignment Problem', 'Brian Christian', 'en', 'B-04', 'cream'],
-  ['我，机器人', '艾萨克·阿西莫夫', 'zh', 'B-05', 'mint'],
-  ['仿生人会梦见电子羊吗？', '菲利普·迪克', 'zh', 'B-06', 'lav'],
-  ['控制论', '诺伯特·维纳', 'zh', 'B-07', 'ink'],
-  ['浪潮之巅', '吴军', 'zh', 'C-01', 'powder'],
-  ['三体', '刘慈欣', 'zh', 'C-02', 'ink'],
-  ['The Code', 'Margaret O’Mara', 'en', 'C-03', 'pink'],
-  ['Troublemakers', 'Leslie Berlin', 'en', 'C-04', 'mustard'],
-  ['Genentech', 'Sally Smith Hughes', 'en', 'C-05', 'mint'],
-  ['The Idea Factory', 'Jon Gertner', 'en', 'C-06', 'rasp'],
-  ['人月神话', '弗雷德里克·布鲁克斯', 'zh', 'D-01', 'cream'],
-  ['鞋狗', '菲尔·奈特', 'zh', 'D-02', 'powder'],
-  ['The Man Who Solved the Market', 'Gregory Zuckerman', 'en', 'D-03', 'lav'],
-  ['人工智能：一种现代的方法', '罗素 & 诺维格', 'zh', 'D-04', 'pink'],
-];
+function contentSeed() {
+  return [
+    { key: 'memo', kind: 'page', layer: 1, mode: 'any', locked_placeholder: false,
+      teaser: { title: 'The Memo · 第 07 期', hook: '本周到访的三个项目、下周的 panel，和一份书单。' },
+      body: {
+        issue: 'No. 07 · 2026 W45',
+        visits: [['远望机器人', '把灵巧手的成本打到原来的五分之一。'], ['溪流模型', '只做一件事：让小模型在手机上跑得像大模型。'], ['既白生物', '用机器人做湿实验，一晚上跑完一周的量。']],
+        next: '下周四 15:00 · 闭门分享「具身智能的下一个十年」，主讲 苏砚、傅辰。',
+        books: ['The Power Law', 'The Soul of a New Machine', '芯片战争'],
+        line: 'Nothing ventured, nothing gained. 这周，下注的人比上周多了三个。' } },
+    { key: 'membertime', kind: 'section', layer: 1, mode: 'day', locked_placeholder: false,
+      teaser: { title: '会员时间 · Members’ Hours', hook: '白天的 library live 只对会员开放：读书、座谈、会面。' },
+      body: { lines: ['10:00–19:00 是会员时间。到店扫门口的签到码，写上同行人数，朋友不用注册。', '大厅中央有开放式座谈：一张话题卡、一张圆桌，谁都可以坐下来。', '多人会议请提前申请，门店确认后为你留座、摆好桌椅。', '咖啡另付，约 18 元一杯。19:00 以后，这里变成演出现场。'] } },
+    { key: 'afterhours', kind: 'page', layer: 1, mode: 'night', locked_placeholder: false,
+      teaser: { title: '隐藏酒单 · After Hours', hook: '入夜之后才出现的一页酒单，名字都取自技术术语。' },
+      body: { drinks: [['Hello, World', '金酒、接骨木、一点盐。每个故事的第一行。'], ['Segfault', '黑朗姆、咖啡、橙皮。越界的那一口。'], ['Kernel Panic', '梅斯卡尔、辣椒、青柠。系统重启前的三秒。'], ['Seed Round', '清酒、白桃、气泡。小，但都是真金白银。'], ['Garbage Collector', '把吧台剩下的好东西收拢成一杯，每晚不同。'], ['Zero-Day', '无酒精。今晚还有正事要做的人喝这个。']], note: '店内点单，凭会员卡。' } },
+    { key: 'shelf', kind: 'feature', layer: 2, mode: 'day', locked_placeholder: true, unlock_rule: { type: 'checkin_count', n: 1 },
+      teaser: { title: '借阅书单 · My Shelf', hook: '白天签到后可以借一本书，借过的书连成你的个人书单。' }, body: { dynamic: 'shelf' } },
+    { key: 'recordings', kind: 'page', layer: 2, mode: 'any', locked_placeholder: true, unlock_rule: { type: 'event_attended', n: 1 },
+      teaser: { title: '现场回放 · Recordings', hook: 'panel 与播客的录音，只有到过现场的会员能回放。' }, body: { dynamic: 'recordings' } },
+    { key: 'speakers', kind: 'page', layer: 2, mode: 'any', locked_placeholder: false, unlock_rule: { type: 'hosted_session' },
+      teaser: { title: '讲者名录 · Speakers', hook: '做过一次分享的会员，名字刻在这里。' }, body: { dynamic: 'speakers' } },
+    { key: 'hidden-room', kind: 'page', layer: 3, mode: 'any', locked_placeholder: false, unlock_rule: { type: 'easter_egg', egg_key: 'hidden-room' },
+      teaser: { title: '地图上没画的房间', hook: '你在店内图的角落按得够久。' },
+      body: { lines: ['这间房间不在任何一版图纸上。', '它在员工区和储藏室之间，门上没有牌子，只有一行用铅笔写的字：', '「1957 年，八个人在这样的房间里决定辞职。」', '下次来，问前台要一把黄铜钥匙。'] } },
+    { key: 'ink', kind: 'feature', layer: 3, mode: 'night', locked_placeholder: false, unlock_rule: { type: 'easter_egg', egg_key: 'ink' },
+      teaser: { title: '隐形墨水', hook: '会员卡背面那一行字，过了 23:00 才显影。' },
+      body: { lines: ['THE BEST WAY TO PREDICT THE FUTURE IS TO INVENT IT.', '— Alan Kay, Xerox PARC, 1971', '凌晨之前，吧台的 Zero-Day 记在我们账上。'] } },
+    { key: 'archive', kind: 'page', layer: 3, mode: 'any', locked_placeholder: false, unlock_rule: { type: 'staff_grant' },
+      teaser: { title: '1957 档案室', hook: '由店长亲手授予。' },
+      body: { lines: ['1957 年 9 月 18 日，八位工程师离开肖克利半导体实验室。', '一位年轻的投资银行家亚瑟·洛克替他们找到了钱，仙童半导体诞生。', '这间档案室收着我们这一代人的「1957」：你下注的那个时刻。', '把你的故事写下来，交给前台，它会被放进这里。'] } },
+  ];
+}
 
 export function seed(t = Date.now()) {
-  const rnd = mulberry32(1215);
-  const pick = arr => arr[Math.floor(rnd() * arr.length)];
-  const ago = (days, hours = 0) => iso(t - days * D - hours * H);
+  const rnd = mulberry32(915);
+  const cfg = structuredCopy(DEFAULT_CONFIG);
+  const today = tonightDate(cfg, t);
+  const ago = (days, hours = 0, minutes = 0) => iso(t - days * D - hours * H - minutes * MIN);
   const db = {
-    version: 1,
-    seededAt: iso(t),
-    floors: [
-      { id: 'library', floor: '3F', name: 'Library', zh: '图书馆', note: '真实藏书 + 现场不插电音乐', status: 'preopening', mode: 'auto', openingDate: OPENING, zones: LIBRARY_ZONES },
-      { id: 'night', floor: '2F', name: 'Nightclub', zh: '夜店', note: '规划中', status: 'planned', mode: 'auto', zones: [] },
-      { id: 'dining', floor: '1F', name: 'Dining & Bar', zh: '餐饮 + 酒吧', note: '规划中', status: 'planned', mode: 'auto', zones: [] },
-    ],
+    version: VERSION, seededAt: iso(t), secret: 'sv-' + token(10),
+    clock: { offsetMs: 0 },
+    config: cfg,
     staff: STAFF.map(s => ({ ...s })),
-    members: [], applications: [], events: [], rsvps: [], reservations: [], books: [],
-    visits: [], requests: [], bulletins: [], notices: [], activity: [], sessions: {},
+    users: [], applications: [], invites: [], memberships: [], payments: [], refunds: [],
+    sessions: [], bookings: [], occupancies: [], holds: [], tickets: [], redemptions: [],
+    checkins: [], checkinOverrides: {}, meetings: [], events: [], registrations: [],
+    content: contentSeed(), unlocks: [], shelf: [], notices: [], audit: [], tokens: {}, nextNo: 1,
+  };
+  const addUser = (name, en, phone, extra = {}) => {
+    const u = { id: 'u' + phone, name, en, phone, city: extra.city || '杭州', company_role: extra.venture || '', intro: '', member_no: null, unlock_seen: false, secret: 'sv-m-' + phone, created_at: extra.created_at || ago(40), notices_seen_at: '' };
+    db.users.push(u);
+    return u;
+  };
+  const segment = (u, source, startIso, months, extra = {}) => {
+    if (!u.member_no) u.member_no = String(db.nextNo++).padStart(4, '0');
+    const endDate = addMonths(hzDate(startIso), months);
+    const m = { id: 'ms' + rid(6), user_id: u.id, source, start_at: startIso, end_at: atHz(endDate, '23:59:59'), ...extra };
+    db.memberships.push(m);
+    return m;
   };
 
-  MEMBERS.forEach(([name, en, venture, sector, base, days], i) => {
-    const no = String(i + 1).padStart(4, '0');
-    const id = 'm' + no.slice(2);
-    db.members.push({
-      id, no, name, en, venture, sector, base,
-      phone: '138000' + no.padStart(5, '0'),
-      hostId: i % 2 ? 's2' : 's1',
-      since: hzDate(t - days * D),
-      status: 'active',
-      secret: 'sv-demo-' + no,
-      bulletinSeenAt: ago(Math.max(0, days - 1)),
-    });
-    const created = t - (days + 9 + Math.floor(rnd() * 10)) * D;
-    db.applications.push({
-      id: 'a' + no, name, en, venture, sector, base, phone: '138000' + no.padStart(5, '0'), wechat: '',
-      thesis: pick(THESES), lead: i < 3 ? '创始团队' : MEMBERS[Math.floor(rnd() * i)][0],
-      leadMemberId: null, source: 'application', invite: null, completed: true,
-      stage: 'welcomed', createdAt: iso(created), stageAt: iso(t - days * D), memberId: id,
-      history: [
-        { stage: 'received', at: iso(created) },
-        { stage: 'diligence', at: iso(created + 2 * D) },
-        { stage: 'initiation', at: iso(created + 6 * D) },
-        { stage: 'welcomed', at: iso(t - days * D) },
-      ],
-      notes: [],
-    });
-  });
-
-  APPLICANTS.forEach(([name, en, venture, sector, base, lead, phone, stage, days, extra = {}], i) => {
-    const created = t - days * D - (i % 5) * H;
-    const leadMember = lead ? db.members[lead - 1] : null;
-    const history = [{ stage: 'received', at: iso(created) }];
-    if (['diligence', 'initiation'].includes(stage)) history.push({ stage: 'diligence', at: iso(created + 3 * D) });
-    if (stage === 'initiation') history.push({ stage: 'initiation', at: iso(created + 8 * D) });
-    if (stage === 'declined') history.push({ stage: 'declined', at: iso(created + 5 * D) });
-    db.applications.push({
-      id: 'b' + String(i + 1).padStart(2, '0'), name, en, venture, sector, base, phone, wechat: '',
-      thesis: extra.completed === false ? '' : THESES[i % THESES.length],
-      lead: leadMember ? leadMember.name : '', leadMemberId: leadMember ? leadMember.id : null,
-      source: 'application', invite: null, completed: true, initiationAt: null,
-      stage, createdAt: iso(created), stageAt: history[history.length - 1].at, memberId: null,
-      history, notes: stage === 'diligence' ? [{ at: iso(created + 4 * D), by: '周行', text: '背景已核实，约了下周线下聊。' }] : [],
-      ...extra,
-    });
-  });
-
-  EVENTS.forEach(([id, title, en, type, date, from, to, venue, capacity, color, description, host, speakers, status = 'published']) => {
-    db.events.push({
-      id, title, en, type, startsAt: atHz(date, from), endsAt: atHz(to < from ? addDays(date, 1) : date, to),
-      venue, capacity, color, description, host, speakers, membersOnly: type !== 'unplugged', status,
-      createdAt: ago(30),
-    });
-  });
-
-  // RSVPs: how many members are going to each event (the persona m07 is set by hand below)
-  const going = { e01: 18, e02: 14, e03: 21, e04: 20, e05: 14, e06: 30, e07: 25, e08: 9, e09: 6 };
-  const waitlisted = { e04: 3 };
-  db.events.forEach(e => {
-    const n = going[e.id] || 0;
-    const pool = db.members.filter(m => m.id !== 'm07').sort(() => rnd() - 0.5);
-    const past = Date.parse(e.endsAt) < t;
-    pool.slice(0, n).forEach((m, k) => db.rsvps.push({
-      id: `r-${e.id}-${m.id}`, eventId: e.id, memberId: m.id, status: past ? 'attended' : 'going', createdAt: ago(20 - (k % 9)),
-    }));
-    pool.slice(n, n + (waitlisted[e.id] || 0)).forEach((m, k) => db.rsvps.push({
-      id: `r-${e.id}-${m.id}`, eventId: e.id, memberId: m.id, status: 'waitlist', createdAt: ago(3, k),
-    }));
-  });
-  for (const [eventId, status] of [['e01', 'attended'], ['e02', 'attended'], ['e03', 'going'], ['e06', 'going']]) {
-    db.rsvps.push({ id: `r-${eventId}-m07`, eventId, memberId: 'm07', status, createdAt: ago(18) });
-  }
-  // visits come from the two preview evenings that already happened
-  db.rsvps.filter(r => r.status === 'attended').forEach(r => {
-    const e = byId(db.events, r.eventId);
-    db.visits.push({ id: 'v-' + r.id.slice(2), memberId: r.memberId, at: iso(Date.parse(e.startsAt) + (10 + Math.floor(rnd() * 50)) * 60e3), place: e.venue, eventId: e.id, by: 's3' });
-  });
-
-  // opening fortnight reservations in the Library
-  const opening = OPENING;
-  const plan = [[0, 'night', 26], [0, 'day', 14], [1, 'day', 11], [1, 'night', 15], [2, 'day', 9], [2, 'night', 12], [3, 'day', 8],
-    [3, 'night', 17], [4, 'day', 12], [4, 'night', 22], [5, 'day', 16], [5, 'night', 20], [6, 'day', 10], [6, 'night', 9]];
-  let seq = 0;
-  for (const [offset, session, seats] of plan) {
-    const date = addDays(opening, offset);
-    let left = seats;
-    const pool = db.members.filter(m => m.id !== 'm07').sort(() => rnd() - 0.5);
-    for (const m of pool) {
-      if (left <= 0) break;
-      const zone = pick(['long', 'long', 'long', 'fireside', 'fireside', 'listening']);
-      const z = LIBRARY_ZONES.find(x => x.id === zone);
-      const used = db.reservations.filter(r => r.date === date && r.session === session && r.zoneId === zone).reduce((s, r) => s + r.party, 0);
-      const party = session === 'day' ? 1 : Math.min(left, 1 + Math.floor(rnd() * 3));
-      if (used + party > z.capacity) continue;
-      left -= party;
-      seq += 1;
-      db.reservations.push({
-        id: 'q' + String(seq).padStart(3, '0'), code: resCode(date, seq), memberId: m.id, floorId: 'library', date, session, zoneId: zone, party,
-        note: '', status: 'confirmed', createdAt: ago(1 + Math.floor(rnd() * 10), Math.floor(rnd() * 20)),
-      });
+  // members, in the order they joined
+  MEMBERS.forEach(([name, en, venture, city], i) => {
+    const u = addUser(name, en, '138000000' + String(i + 1).padStart(2, '0'), { venture, city, created_at: ago(70 - i * 2) });
+    u.unlock_seen = true;
+    const gift = i < 12;
+    const start = ago(gift ? 32 - i : 28 - i);
+    if (gift) {
+      const inv = { id: 'iv' + rid(6), token: 'SV-' + token(6), issued_by: 'st1', note: `致 ${name}`, claim_deadline: atHz(cfg.giftClaimDeadline, '23:59:59'), status: 'claimed', claimed_by: u.id, claimed_at: start, bound_phone: u.phone, held_by: null, created_at: ago(40) };
+      db.invites.push(inv);
+      segment(u, 'gift', start, cfg.giftMonths, { invite_id: inv.id });
+    } else {
+      db.applications.push({ id: 'ap' + rid(6), user_id: u.id, status: 'completed', profile: { name, phone: u.phone, city, company_role: venture, intro: '', referrer: MEMBERS[i % 5][0] }, history: [{ status: 'under_review', at: ago(40 - i) }, { status: 'approved_awaiting_payment', at: ago(36 - i) }, { status: 'completed', at: start }], reviewer: 'st1', review_note: '', created_at: ago(40 - i), updated_at: start });
+      const p = { id: 'pm' + rid(6), kind: 'membership', user_id: u.id, amount: cfg.memberPrice, provider: 'mock', status: 'paid', created_at: start, paid_at: start };
+      db.payments.push(p);
+      segment(u, 'paid', start, 1, { payment_id: p.id });
+      if (i === 14) { // 唐晚: expired ten days ago, still inside the 30-day renew window
+        const seg = db.memberships[db.memberships.length - 1];
+        seg.start_at = ago(41); seg.end_at = atHz(addDays(hzDate(t), -10), '23:59:59');
+      }
     }
-  }
-  seq += 1;
-  db.reservations.push({ id: 'q' + String(seq).padStart(3, '0'), code: resCode(addDays(opening, 1), seq), memberId: 'm07', floorId: 'library', date: addDays(opening, 1), session: 'day', zoneId: 'long', party: 1, note: '靠窗的位置，谢谢。', status: 'confirmed', createdAt: ago(2) });
-
-  BOOKS.forEach(([title, author, lang, shelf, color], i) => {
-    db.books.push({ id: 'k' + String(i + 1).padStart(2, '0'), title, author, lang, shelf, color, status: 'shelf', holderId: null, heldAt: null, dueAt: null });
   });
-  Object.assign(db.books[0], { status: 'held', holderId: 'm07', heldAt: ago(1) });
-  Object.assign(db.books[3], { status: 'held', holderId: 'm03', heldAt: ago(2) });
-  Object.assign(db.books[15], { status: 'held', holderId: 'm12', heldAt: ago(4) });
+  const U = n => db.users[n - 1];
+  const lin = U(7);
+  lin.notices_seen_at = ago(1);
 
-  db.requests.push(
-    { id: 'c01', memberId: 'm03', type: 'guest', text: '12.15 开业之夜想带两位 LP 朋友过来，是否可以？', status: 'open', createdAt: ago(0, 5), reply: null, repliedAt: null, repliedBy: null },
-    { id: 'c02', memberId: 'm07', type: 'room', text: '12.16 下午想订一间小书房，开一个四个人的会，需要投影。', status: 'replied', createdAt: ago(2, 3), reply: '已为你预留 12.16 14:00–17:00 的小书房 B，投影和白板都会备好。', repliedAt: ago(2), repliedBy: 's1' },
-    { id: 'c03', memberId: 'm12', type: 'book', text: '能否帮忙找一本《The Soul of a New Machine》的初版？', status: 'open', createdAt: ago(1, 2), reply: null, repliedAt: null, repliedBy: null },
-    { id: 'c04', memberId: 'm17', type: 'other', text: '想推荐一位做灵巧手的朋友来做一次闭门分享，该找谁聊？', status: 'open', createdAt: ago(3, 6), reply: null, repliedAt: null, repliedBy: null },
+  // people on their way in
+  const visitor = addUser('陈一', 'Chen Yi', '13700000001', { created_at: ago(6) });
+  visitor.company_role = '初创公司 · 产品经理';
+  const mkApp = (name, en, phone, status, days, extra = {}) => {
+    const u = addUser(name, en, phone, { created_at: ago(days) });
+    u.company_role = extra.venture || '';
+    const history = [{ status: 'under_review', at: ago(days) }];
+    if (status !== 'under_review') history.push({ status, at: ago(Math.max(0, days - 2)), by: 'st1' });
+    db.applications.push({ id: 'ap' + rid(6), user_id: u.id, status, profile: { name, phone, city: extra.city || '杭州', company_role: extra.venture || '', intro: extra.intro || '', referrer: extra.referrer || '' }, history, reviewer: status === 'under_review' ? null : 'st1', review_note: extra.note || '', created_at: ago(days), updated_at: history[history.length - 1].at });
+    return u;
+  };
+  mkApp('宋予安', 'Song Yuan', '13900000021', 'under_review', 2, { venture: '予安智能 · 创始人', intro: '做面向工厂的视觉质检模型，团队 12 人。', referrer: '陈牧之' });
+  mkApp('黎昕', 'Li Xin', '13900000024', 'need_info', 5, { venture: '昕辰模型 · 研究员', city: '上海', intro: '研究方向是长上下文。', note: '请补充一下现在在做的项目，以及推荐人是谁。' });
+  mkApp('钟灵', 'Zhong Ling', '13900000031', 'approved_awaiting_payment', 7, { venture: '灵犀机器人 · 创始人', intro: '做养老场景的服务机器人。', referrer: '林知远' });
+  mkApp('罗思齐', 'Luo Siqi', '13900000012', 'under_review', 1, { venture: '思齐量化 · 合伙人', city: '上海', intro: '量化出身，最近在看 AI 基础设施。', referrer: '江念' });
+  mkApp('金雨桐', 'Jin Yutong', '13900000013', 'under_review', 3, { venture: '桐语智能 · CEO', intro: '语音交互，刚拿到天使轮。' });
+  mkApp('杜若', 'Du Ruo', '13900000014', 'rejected', 9, { venture: '若木咨询 · 顾问', city: '北京', note: '这一次没能成行。' });
+  const invitee = addUser('向南', 'Xiang Nan', '13900000011', { created_at: ago(1) });
+  invitee.company_role = '具身未来 · 创始人';
+  db.invites.push(
+    { id: 'iv-xn', token: 'SV-7K2QXA', issued_by: 'st1', note: '致 向南：林知远说你一定会喜欢这里。', claim_deadline: atHz(cfg.giftClaimDeadline, '23:59:59'), status: 'issued', claimed_by: null, claimed_at: null, bound_phone: invitee.phone, held_by: invitee.id, created_at: ago(1) },
+    { id: 'iv-open', token: 'SV-WELCOME', issued_by: 'st1', note: '首批受邀朋友 · 演示用邀请（任何手机号可领）', claim_deadline: atHz(cfg.giftClaimDeadline, '23:59:59'), status: 'issued', claimed_by: null, claimed_at: null, bound_phone: null, held_by: null, created_at: ago(3) },
+    { id: 'iv-old', token: 'SV-MISSED', issued_by: 'st1', note: '致 一位没来得及领取的朋友', claim_deadline: ago(2), status: 'issued', claimed_by: null, claimed_at: null, bound_phone: '13900000099', held_by: null, created_at: ago(30) },
   );
 
-  db.bulletins.push(
-    { id: 'n03', title: '开业周预订已开放', body: '3F Library 将于 12 月 15 日开业。白天（10:00–18:00）仅对会员开放，入夜后向公众开放。开业两周的座位现在可以在「预订」里选好。', at: ago(1, 2), by: 's3' },
-    { id: 'n02', title: '创始会员之夜 · 11.21', body: '第一批会员的晚餐，在筹备处。座位有限，请在「节目」里确认出席。', at: ago(6), by: 's1' },
-    { id: 'n01', title: '关于携友到访', body: '夜间时段，每位会员可携两位来宾；白天为会员时段，暂不接待来宾。如有特殊安排，按铃找你的专属服务人员。', at: ago(14), by: 's3' },
-  );
+  // nightly sessions: yesterday (history) through the next nine nights
+  for (let i = -1; i <= 9; i++) {
+    const date = addDays(today, i);
+    const [title, en, performers] = SHOWS[(i + 7) % SHOWS.length];
+    db.sessions.push({ id: 's' + date.replaceAll('-', ''), date, title, en, performers, confirm_policy: 'tiered', status: i < 0 ? 'closed' : 'on_sale', reserved: ['B05', 'B06'], paused: [], show_start: cfg.showStart, hold_deadline: cfg.holdDeadline });
+  }
+  const S = i => db.sessions[i + 1];
 
-  db.notices.push(
-    { id: 'o03', to: 'm07', kind: 'request', title: '沈岚 回复了你', body: '已为你预留 12.16 14:00–17:00 的小书房 B，投影和白板都会备好。', at: ago(2), read: false },
-    { id: 'o02', to: 'm07', kind: 'referral', title: '你推荐的 钟灵 进入了入会仪式', body: '仪式定在 12.14 16:00。谢谢你的推荐。', at: ago(3), read: true },
-    { id: 'o01', to: 'm07', kind: 'rsvp', title: '座位已确认 · 创始会员之夜', body: '11.21 19:00 · 筹备处 · 杭州', at: ago(9), read: true },
-  );
+  // bookings
+  const book = (u, sessionIdx, zone, codes, party, status, opts = {}) => {
+    const s = S(sessionIdx);
+    const z = zoneOf(zone);
+    const member = !!db.memberships.find(m => m.user_id === u.id && Date.parse(m.start_at) <= t && t <= Date.parse(m.end_at));
+    const kind = z.kind === 'booth' ? 'booth' : 'seats';
+    const lines = codes.map(c => (kind === 'booth' ? { code: c, seats: resourceOf(c).capacity } : { code: c, seats: c === codes[codes.length - 1] ? party - (codes.length - 1) * resourceOf(codes[0]).capacity : resourceOf(c).capacity }));
+    if (kind === 'seats' && codes.length === 1) lines[0].seats = party;
+    const tier = resourceOf(codes[0]).tier;
+    const pr = cfg.prices[tier];
+    const deposit = kind === 'booth' ? fen((member ? pr.member : pr.guest) * cfg.depositRatio) : 0;
+    const tickets = kind === 'seats' && !member ? party : 0;
+    const total = kind === 'booth' ? deposit * codes.length : tickets * cfg.ticketPrice;
+    const created = opts.created || ago(2);
+    const b = {
+      id: 'bk' + rid(8), code: 'LL-' + token(4), user_id: u.id, session_id: s.id, date: s.date, zone, kind, party_size: party, units: codes.length,
+      identity_snapshot: member ? 'member_active' : 'non_member', lines, confirm_mode: kind === 'booth' || codes.length > 1 ? 'manual' : 'instant',
+      manual_reasons: kind === 'booth' ? ['booth'] : [], note: opts.note || '', explanation: '', status,
+      lock_expires_at: null, confirm_deadline_at: status === 'pending_confirm' ? iso(Date.parse(created) + cfg.confirmMinutes * MIN) : null,
+      table_released: false, reject_reason: opts.reason || '', suggestion: opts.suggestion || '', suggestion_zone: opts.suggestionZone || '',
+      price_snapshot: { lines: codes.map(c => ({ code: c, deposit: kind === 'booth' ? deposit : 0, tickets: kind === 'seats' && !member ? party : 0 })), deposit_each: deposit, min_spend_member: kind === 'booth' ? pr.member : 0, min_spend_guest: kind === 'booth' ? pr.guest : 0, ticket_price: cfg.ticketPrice, tickets, total_due: total },
+      rules_version: RULES_VERSION, created_at: created, paid_at: total ? created : null, confirmed_at: status === 'confirmed' || status === 'fulfilled' ? iso(Date.parse(created) + 6 * MIN) : null,
+      verified_at: status === 'fulfilled' ? ago(sessionIdx < 0 ? 0.9 : 0) : null, history: [{ status, at: created }],
+    };
+    db.bookings.push(b);
+    if (total) db.payments.push({ id: 'pm' + rid(6), kind: kind === 'booth' ? 'deposit' : 'ticket', user_id: u.id, booking_id: b.id, amount: total, provider: 'mock', status: 'paid', created_at: created, paid_at: created });
+    const live = ['pending_confirm', 'confirmed', 'fulfilled'].includes(status);
+    if (live && sessionIdx >= 0) for (const l of lines) db.occupancies.push({ id: 'oc' + rid(8), resource: l.code, session_id: s.id, booking_id: b.id, kind: status === 'pending_confirm' ? 'pending_hold' : 'confirmed', seats: kind === 'seats' ? l.seats : null, expires_at: null, released_at: null, release_reason: null, used_at: status === 'fulfilled' ? b.verified_at : null });
+    if (tickets && (status === 'confirmed' || status === 'fulfilled')) db.tickets.push({ id: 'tk' + rid(6), booking_id: b.id, session_id: s.id, user_id: u.id, count: tickets, drink_redeemed: status === 'fulfilled', verification: status === 'fulfilled' ? 'verified' : 'unverified' });
+    return b;
+  };
+  // tonight
+  book(U(4), 0, 'wall', ['B01'], 6, 'confirmed', { created: ago(1, 3) });
+  const guestBooth = addUser('王越', 'Wang Yue', '13700000002', { created_at: ago(2) });
+  book(guestBooth, 0, 'wall', ['B03'], 5, 'pending_confirm', { created: ago(0, 0, 12), note: '' });
+  book(U(1), 0, 'lounge', ['B07'], 5, 'pending_confirm', { created: ago(0, 0, 26), note: '想要靠近吧台那一侧' });
+  book(addUser('赵小满', 'Zhao Xiaoman', '13700000003', { created_at: ago(1) }), 0, 'tables', ['T01'], 3, 'confirmed', { created: ago(0, 5) });
+  book(U(9), 0, 'tables', ['T02'], 4, 'confirmed', { created: ago(0, 4) });
+  book(U(12), 0, 'bar', ['S01'], 1, 'confirmed', { created: ago(0, 2) });
+  book(U(16), 0, 'pit', ['C01'], 2, 'confirmed', { created: ago(0, 1) });
+  book(addUser('李同', 'Li Tong', '13700000004', { created_at: ago(1) }), 0, 'pairs', ['P01'], 2, 'confirmed', { created: ago(0, 6) });
+  // tomorrow and beyond
+  book(lin, 1, 'wall', ['B02'], 4, 'confirmed', { created: ago(1) });
+  book(visitor, 1, 'pairs', ['P02'], 2, 'confirmed', { created: ago(0, 8) });
+  book(U(3), 2, 'round', ['B05'], 8, 'confirmed', { created: ago(1) });
+  book(U(17), 3, 'wall', ['B04'], 6, 'confirmed', { created: ago(0, 20) });
+  // history
+  book(lin, -1, 'tables', ['T03'], 2, 'fulfilled', { created: ago(3) });
+  const rej = book(visitor, -1, 'wall', ['B02'], 5, 'rejected', { created: ago(2), reason: '那晚墙边卡座已被包场。', suggestion: '可以改订沙龙沙发，或者第二天的墙边卡座。', suggestionZone: 'lounge' });
+  const rp = db.payments.find(p => p.booking_id === rej.id);
+  db.refunds.push({ id: 'rf' + rid(6), payment_id: rp.id, booking_id: rej.id, user_id: visitor.id, amount: rp.amount, reason: 'rejected', status: 'succeeded', created_at: ago(2), settled_at: ago(1, 22) });
 
-  db.activity = [
-    { at: ago(0, 2), kind: 'application', text: '向南 经 林知远 推荐，提交了入会申请' },
-    { at: ago(0, 5), kind: 'request', text: '许嘉禾 按铃：携友到访' },
-    { at: ago(1, 1), kind: 'reservation', text: '傅辰 预订了 12.20 夜晚 · 长桌阅览' },
-    { at: ago(1, 2), kind: 'bulletin', text: '周行 发布了公告「开业周预订已开放」' },
-    { at: ago(1, 6), kind: 'application', text: '罗思齐 提交了入会申请' },
-    { at: ago(2, 0), kind: 'member', text: '何以安 完成入会仪式，成为 No.0024' },
-    { at: ago(2, 3), kind: 'request', text: '沈岚 回复了 林知远 的礼宾请求' },
-    { at: ago(3, 1), kind: 'rsvp', text: '苏砚 报名了「闭门分享：具身智能的下一个十年」' },
-  ];
+  // events: panels, podcasts, roundtables
+  const ev = (id, kind, title, en, dayOffset, from, to, layer, capacity, extra = {}) => {
+    const date = addDays(today, dayOffset);
+    db.events.push({ id, kind, title, en, intro: extra.intro || '', host: extra.host || '', guests: extra.guests || '', start_at: atHz(date, from), end_at: atHz(date, to), location: extra.location || '3F · library live', signup_open_at: ago(10), signup_close_at: atHz(date, from), capacity, layer, public_signup: !!extra.public, teaser: { title, hook: extra.hook || '' }, tags: extra.tags || [], status: 'published' });
+  };
+  ev('ev-hand', 'panel', '闭门分享：机器人的手', 'The Robot’s Hand', -5, '15:00', '17:00', 1, 20, { host: '季长风', guests: '叶闻舟', intro: '灵巧手为什么这么难？两位一线工程师讲他们拆坏过的东西。不录音外传，只给到场的人回放。', hook: '两位一线工程师，讲他们拆坏过的东西。' });
+  ev('ev-agent', 'roundtable', '开放座谈：AI Agent 的商业模式', 'Roundtable: The Agent Business', 0, '15:00', '16:30', 1, 12, { host: '陈牧之', intro: '一张圆桌，一个话题。带着你的观点或问题来，谁都可以坐下。', hook: '一张圆桌，一个话题，谁都可以坐下。', location: '圆桌座谈 · 1957' });
+  ev('ev-read', 'roundtable', '早间座谈：读《The Power Law》第三章', 'Morning Read: The Power Law, ch. 3', 1, '11:00', '12:00', 1, 10, { host: '周以宁', intro: '读完第三章即可加入。书在 3F 书架，可以现场借。', hook: '读完第三章即可加入。', location: '座谈沙龙' });
+  ev('ev-podcast', 'podcast', '播客现场录制 · 第 01 期', 'Live Podcast, Episode 01', 2, '16:00', '17:30', 0, 30, { host: '许嘉禾', guests: '陈牧之', intro: '《Something Ventured》第一期：谁在给机器人下注？现场观众的问题会被剪进正片。', hook: '谁在给机器人下注？', public: true });
+  ev('ev-embodied', 'panel', '闭门分享：具身智能的下一个十年', 'Embodied AI, the Next Decade', 4, '15:00', '17:00', 1, 20, { host: '苏砚', guests: '傅辰 · 周以宁', intro: '数据、硬件、商业化，哪一个会先成为瓶颈？两位创始人与一位投资人的闭门对谈。', hook: '数据、硬件、商业化，哪一个会先成为瓶颈？' });
+  ev('ev-public', 'panel', '公开课：风险投资的八十年', 'Eighty Years of Venture', 3, '14:00', '15:30', 0, 40, { host: '江念', intro: '从 1946 年的 ARD 到今天的 AI 基金：一堂讲给所有人的课。非会员可报名。', hook: '从 1946 年的 ARD 讲到今天。', public: true });
+  ev('ev-maker', 'maker', '创客午后：拆一台扫地机器人', 'Maker Afternoon: Teardown', 5, '14:00', '17:00', 1, 12, { host: '季长风', intro: '带上螺丝刀。我们拆开一台扫地机器人，看看传感器是怎么排布的。', hook: '带上螺丝刀。' });
+  const reg = (eventId, u, status = 'registered', hosted = false) => db.registrations.push({ id: 'rg' + rid(6), event_id: eventId, user_id: u.id, status, hosted, created_at: ago(6) });
+  [U(14), lin, U(6), U(2), U(10)].forEach((u, i) => reg('ev-hand', u, 'attended', i === 0));
+  [U(2), U(5), U(12)].forEach(u => reg('ev-agent', u));
+  [U(1), U(9)].forEach(u => reg('ev-read', u));
+  [U(3), U(8), visitor].forEach(u => reg('ev-podcast', u));
+  [U(4), U(17), U(1), U(6), U(11)].forEach(u => reg('ev-embodied', u));
+  // unlocks that those facts imply
+  const unlock = (u, key, source, at) => db.unlocks.push({ id: 'ul' + rid(6), user_id: u.id, key, source, granted_by: null, at, revoked_at: null });
+  [U(14), lin, U(6), U(2), U(10)].forEach(u => unlock(u, 'recordings', 'event_attended', ago(5)));
+  unlock(U(14), 'speakers', 'hosted_session', ago(5));
+  unlock(U(1), 'archive', 'staff_grant', ago(8));
+
+  // daytime: check-ins and meetings
+  [U(1), U(2), U(9), U(12), U(19), U(20)].forEach((u, i) => {
+    const day = addDays(today, -1 - (i % 3));
+    const at = atHz(day, ['11:20', '14:05', '15:40', '16:30', '13:15', '10:50'][i]); // members' hours only
+    db.checkins.push({ id: 'ci' + rid(6), user_id: u.id, date: day, at, companions: i % 3 });
+    unlock(u, 'shelf', 'checkin_count', at);
+  });
+  db.meetings.push(
+    { id: 'mt' + rid(6), user_id: lin.id, date: addDays(today, 1), start: '14:00', end: '16:00', party_size: 5, needs: '五个人，需要投影和白板。', status: 'accepted', counter: null, reply: '已为你留好沙龙沙发 1998，投影备好。', created_at: ago(1) },
+    { id: 'mt' + rid(6), user_id: lin.id, date: addDays(today, 3), start: '17:00', end: '19:30', party_size: 8, needs: '八个人的季度复盘。', status: 'counter_proposed', counter: { start: '16:30', end: '18:30', note: '会议不能跨过 19:00，建议提前半小时开始。' }, reply: '', created_at: ago(0, 6) },
+    { id: 'mt' + rid(6), user_id: U(4).id, date: addDays(today, 2), start: '10:30', end: '12:00', party_size: 6, needs: '投资人见面，需要安静。', status: 'submitted', counter: null, reply: '', created_at: ago(0, 3) },
+  );
+  db.shelf.push({ id: 'sh' + rid(6), user_id: U(1).id, book: 'k1', date: addDays(today, -2), at: ago(2) });
+
+  // notices for the personas
+  const note = (u, kind, title, body, at, read = true) => db.notices.push({ id: 'n' + rid(8), to: u.id, kind, title, body, at, read });
+  note(lin, 'meeting', '门店提议调整会议时间', '会议不能跨过 19:00，建议改为 16:30–18:30。', ago(0, 6), false);
+  note(lin, 'booking', '已交割 · 墙边卡座', '明晚的墙边卡座已确认，桌号 B02「1968」。', ago(1), true);
+  note(visitor, 'refund', '退款已到账', `${yuan(rp.amount)} 已原路退回。`, ago(1, 22), false);
+  note(visitor, 'booking', '本轮未进 · 门店未接受', '那晚墙边卡座已被包场。可以改订沙龙沙发，或者第二天的墙边卡座。', ago(2), true);
+  db.audit.push({ id: 'au' + rid(6), actor: 'st1', action: 'booking.reject', object_type: 'booking', object_id: rej.id, reason: '那晚墙边卡座已被包场。', at: ago(2) });
   return db;
 }
-
-function resCode(date, n) {
-  return `3F-${date.slice(5, 7)}${date.slice(8, 10)}-${String(n % 1000).padStart(3, '0')}`;
-}
+function structuredCopy(v) { return JSON.parse(JSON.stringify(v)); }
 
 /* =========================================================
-   Views (what each side is allowed to see)
+   Derived facts
    ========================================================= */
-const staffView = s => s && ({ id: s.id, name: s.name, en: s.en, role: s.role, roleEn: s.roleEn });
-export const brief = m => m && ({ id: m.id, no: m.no, name: m.name, en: m.en, sector: m.sector, base: m.base, venture: m.venture });
+const userOf = (db, id) => byId(db.users, id);
+const segsOf = (db, uid) => db.memberships.filter(m => m.user_id === uid).sort((a, b) => a.start_at.localeCompare(b.start_at));
+const activeSeg = (db, uid, t) => segsOf(db, uid).find(m => Date.parse(m.start_at) <= t && t <= Date.parse(m.end_at));
+const latestApp = (db, uid) => db.applications.filter(a => a.user_id === uid).sort((a, b) => b.created_at.localeCompare(a.created_at))[0] || null;
+const heldInvite = (db, u, t) => db.invites.find(i => i.status === 'issued' && Date.parse(i.claim_deadline) >= t && (i.held_by === u.id || (i.bound_phone && i.bound_phone === u.phone)));
 
-function eventView(db, e, memberId, t) {
-  const rs = db.rsvps.filter(r => r.eventId === e.id);
-  const taken = rs.filter(r => r.status === 'going' || r.status === 'attended').length;
-  const mine = memberId ? rs.find(r => r.memberId === memberId && r.status !== 'cancelled') : null;
+export function identityOf(db, u, t) {
+  if (!u) return 'guest';
+  if (activeSeg(db, u.id, t)) return 'member_active';
+  if (heldInvite(db, u, t)) return 'invitee';
+  const app = latestApp(db, u.id);
+  if (app && ['under_review', 'need_info', 'approved_awaiting_payment'].includes(app.status)) return 'applicant';
+  if (segsOf(db, u.id).length) return 'member_expired';
+  return 'non_member';
+}
+const isMemberOn = (db, u, date) => !!u && segsOf(db, u.id).some(m => hzDate(m.start_at) <= date && date <= hzDate(m.end_at));
+
+function membershipView(db, u, t) {
+  const segs = segsOf(db, u.id);
+  if (!segs.length) return null;
+  const cur = activeSeg(db, u.id, t);
+  const last = segs[segs.length - 1];
+  const end = cur ? segs.filter(s => Date.parse(s.start_at) >= Date.parse(cur.start_at)).reduce((e, s) => (s.end_at > e ? s.end_at : e), cur.end_at) : last.end_at;
+  const daysLeft = daysBetween(hzDate(t), hzDate(end));
+  const sinceExpiry = cur ? 0 : daysBetween(hzDate(end), hzDate(t));
   return {
-    id: e.id, title: e.title, en: e.en, type: e.type, startsAt: e.startsAt, endsAt: e.endsAt, venue: e.venue,
-    capacity: e.capacity, color: e.color, description: e.description, host: e.host, speakers: e.speakers,
-    membersOnly: e.membersOnly, status: e.status,
-    taken, left: Math.max(0, e.capacity - taken), waitlist: rs.filter(r => r.status === 'waitlist').length,
-    mine: mine ? mine.status : null, past: Date.parse(e.endsAt) < t,
+    active: !!cur, member_no: u.member_no, source: (cur || last).source, since: segs[0].start_at, end_at: end, days_left: daysLeft,
+    expiring_soon: !!cur && daysLeft <= 7, expired_days: sinceExpiry,
+    can_renew: !!cur || sinceExpiry <= db.config.renewWithoutReviewDays,
+    segments: segs.map(s => ({ source: s.source, start_at: s.start_at, end_at: s.end_at })),
   };
 }
 
-function appView(db, a, admin = false) {
-  const lead = a.leadMemberId ? byId(db.members, a.leadMemberId) : null;
-  const member = a.memberId ? byId(db.members, a.memberId) : null;
-  const v = {
-    id: a.id, name: a.name, en: a.en, venture: a.venture, sector: a.sector, base: a.base,
-    lead: lead ? lead.name : a.lead, stage: a.stage, step: stageOf(a.stage).step,
-    createdAt: a.createdAt, stageAt: a.stageAt, initiationAt: a.initiationAt || null,
-    history: a.history.map(h => ({ stage: h.stage, at: h.at })), thesis: a.thesis, completed: a.completed !== false,
-    memberNo: member ? member.no : null, source: a.source,
+/* ---------- inventory ---------- */
+const liveOcc = (db, t) => db.occupancies.filter(o => !o.released_at && (!o.expires_at || Date.parse(o.expires_at) > t));
+const sessionOf = (db, id) => byId(db.sessions, id);
+
+/* the state of every table for one viewer (spec 9.2), top rule wins */
+function tableStates(db, session, viewer, t, { admin = false } = {}) {
+  const occ = liveOcc(db, t).filter(o => o.session_id === session.id);
+  const member = viewer && isMemberOn(db, viewer, session.date);
+  const beforeRelease = t < Date.parse(atHz(session.date, db.config.switchAt));
+  const out = {};
+  for (const r of RESOURCES) {
+    const mine = occ.filter(o => o.resource === r.code);
+    const taken = mine.reduce((s, o) => s + (r.unit === 'whole' ? r.capacity : (o.seats || 0)), 0);
+    const reserved = session.reserved.includes(r.code);
+    let state;
+    const ownBooking = viewer && mine.find(o => o.booking_id && (byId(db.bookings, o.booking_id) || {}).user_id === viewer.id);
+    if (session.paused.includes(r.code)) state = 'paused';
+    else if (!admin && ownBooking) state = 'mine';
+    else if (r.unit === 'whole' && mine.length) {
+      const k = mine[0].kind;
+      state = admin ? ({ payment_lock: 'locking', pending_hold: 'pending', confirmed: 'booked', offline_hold: 'offline' })[k] : k === 'payment_lock' ? 'locking' : 'booked';
+    } else if (r.unit === 'seats' && taken >= r.capacity) state = admin && mine.some(o => o.kind === 'pending_hold') ? 'pending' : 'booked';
+    else if (reserved && admin) state = 'reserved_open';
+    else if (reserved && !member && beforeRelease) state = 'reserved_sealed';
+    else if (reserved && member) state = 'reserved_open';
+    else state = admin && mine.some(o => o.kind === 'pending_hold') ? 'pending' : 'available';
+    out[r.code] = { state, taken: r.unit === 'seats' ? Math.min(r.capacity, taken) : 0, reserved, booking: admin && mine[0] ? mine[0].booking_id || null : undefined, hold: admin && mine[0] && mine[0].hold_id ? mine[0].hold_id : undefined };
+  }
+  return out;
+}
+
+function priceFor(db, tier, member) {
+  const p = db.config.prices[tier] || { member: 0, guest: 0 };
+  return { min_member: p.member, min_guest: p.guest, deposit_member: fen(p.member * db.config.depositRatio), deposit_guest: fen(p.guest * db.config.depositRatio), min: member ? p.member : p.guest, deposit: fen((member ? p.member : p.guest) * db.config.depositRatio) };
+}
+
+function zoneSummary(db, session, viewer, t, states) {
+  const member = viewer && isMemberOn(db, viewer, session.date);
+  return ZONES.map(z => {
+    const rs = RESOURCES.filter(r => r.zone === z.id);
+    const free = r => ['available', 'reserved_open'].includes(states[r.code].state);
+    if (z.kind === 'booth') {
+      const cap = rs[0].capacity;
+      return { id: z.id, kind: 'booth', unit: 'booth', total: rs.length, free: rs.filter(free).length, capacity: cap, sealed: rs.some(r => states[r.code].state === 'reserved_sealed'), reserved: rs.some(r => states[r.code].reserved), price: priceFor(db, rs[0].tier, member) };
+    }
+    const seatsTotal = rs.reduce((s, r) => s + r.capacity, 0);
+    const seatsFree = rs.filter(r => states[r.code].state !== 'paused').reduce((s, r) => s + (r.capacity - states[r.code].taken), 0);
+    return { id: z.id, kind: z.kind, unit: 'seat', total: seatsTotal, free: Math.max(0, seatsFree), capacity: rs[0].capacity, sealed: false, reserved: false, ticket: member ? 0 : db.config.ticketPrice };
+  });
+}
+
+/* ---------- booking: quote, then create (zone-based) ---------- */
+function bookingWindow(db, viewer, t) {
+  const member = identityOf(db, viewer, t) === 'member_active';
+  const days = member ? db.config.windowMember : db.config.windowGuest;
+  const start = tonightDate(db.config, t);
+  return { member, dates: Array.from({ length: days }, (_, i) => addDays(start, i)) };
+}
+
+function quote(db, user, args, t) {
+  const session = sessionOf(db, args.session_id);
+  if (!session || session.status !== 'on_sale') fail('这一场暂不开放预订', 'not_found', 404);
+  const win = bookingWindow(db, user, t);
+  if (!win.dates.includes(session.date)) ruleFail('R-BK-03', `${win.member ? '会员' : '非会员'}可以预订 ${win.dates.length} 天内的场次`);
+  if (t > Date.parse(atHz(session.date, db.config.onlineCutoff))) ruleFail('R-BK-05', `当晚 ${db.config.onlineCutoff} 后停止线上订座，请到现场`);
+  const z = zoneOf(args.zone);
+  if (!z) fail('请选择一个区域');
+  const party = parseInt(args.party_size, 10);
+  if (!(party >= 1 && party <= 40)) fail('请填写人数');
+  const member = isMemberOn(db, user, session.date);
+  const warnings = [];
+  if (identityOf(db, user, t) === 'member_active' && !member) warnings.push({ rule: 'R-BK-04', text: '这一晚超出了你的会员有效期，将按非会员规则预订；先续费可按会员规则。' });
+  const states = tableStates(db, session, user, t);
+  const reasons = [];
+  let lines = [];
+  let required = 1;
+  const extra = Math.max(0, Math.min(2, parseInt(args.extra, 10) || 0));
+  const note = cleanText(args.note, 120);
+  const explanation = cleanText(args.explanation, 120);
+  const already = db.bookings.filter(b => b.user_id === (user && user.id) && b.session_id === session.id && ['pending_payment', 'pending_confirm', 'confirmed'].includes(b.status));
+  if (already.length) warnings.push({ rule: 'R-BK-11', text: `你这一晚已有 ${already.reduce((s, b) => s + b.units, 0)} 桌` });
+  if (z.kind === 'booth') {
+    const rs = RESOURCES.filter(r => r.zone === z.id);
+    const cap = rs[0].capacity;
+    required = Math.ceil(party / cap);
+    const count = required + extra;
+    if (count > db.config.maxResources) ruleFail('R-BK-06', `一笔订单最多 ${db.config.maxResources} 张桌，更多请分开下单或联系门店`);
+    const free = rs.filter(r => ['available', 'reserved_open'].includes(states[r.code].state))
+      .sort((a, b) => (states[b.code].reserved - states[a.code].reserved) * (member ? 1 : -1) || a.code.localeCompare(b.code));
+    if (free.length < count) fail(free.length ? `${z.zh}这一晚只剩 ${free.length} 张了` : `${z.zh}这一晚已经订满了`, 'conflict', 409, 'R-BK-12');
+    lines = free.slice(0, count).map(r => ({ code: r.code, seats: r.capacity }));
+    reasons.push('booth');
+    if (count > 1) reasons.push('multi_resource');
+    if (extra) reasons.push('over_required');
+    const reservedBefore = already.flatMap(b => b.lines.map(l => l.code)).filter(c => session.reserved.includes(c)).length;
+    if (lines.filter(l => session.reserved.includes(l.code)).length + reservedBefore > 1) reasons.push('extra_reserved');
+    if ((reasons.includes('over_required') || reasons.includes('extra_reserved')) && !explanation) ruleFail(reasons.includes('extra_reserved') ? 'R-BK-10' : 'R-BK-08', '多要的桌需要写一句说明，门店人工确认');
+  } else {
+    if (!member) {
+      if (!db.config.ticketSalesEnabled) ruleFail('R-TK-07', '门票暂未开售，非会员可以预订卡座');
+      const bought = db.tickets.filter(k => k.user_id === (user && user.id) && k.session_id === session.id && k.verification !== 'expired').reduce((s, k) => s + k.count, 0)
+        + db.bookings.filter(b => b.user_id === (user && user.id) && b.session_id === session.id && b.status === 'pending_payment').reduce((s, b) => s + (b.price_snapshot.tickets || 0), 0);
+      if (party > db.config.ticketCompanions + 1) ruleFail('R-TK-03', `购票人本人到场，最多带 ${db.config.ticketCompanions} 位同行人`);
+      if (bought + party > db.config.ticketLimit) ruleFail('R-TK-02', `每人每场最多 ${db.config.ticketLimit} 张票${bought ? `，你已买了 ${bought} 张` : ''}`);
+    }
+    const rs = RESOURCES.filter(r => r.zone === z.id && states[r.code].state !== 'paused');
+    const freeOf = r => r.capacity - states[r.code].taken;
+    const whole = rs.filter(r => states[r.code].state !== 'booked' && freeOf(r) >= party).sort((a, b) => freeOf(a) - freeOf(b) || a.code.localeCompare(b.code))[0];
+    if (whole) lines = [{ code: whole.code, seats: party }];
+    else {
+      let left = party;
+      for (const r of rs.filter(r => freeOf(r) > 0).sort((a, b) => freeOf(b) - freeOf(a))) {
+        if (left <= 0) break;
+        const n = Math.min(left, freeOf(r));
+        lines.push({ code: r.code, seats: n });
+        left -= n;
+      }
+      if (left > 0) fail(`${z.zh}这一晚只剩 ${party - left} 个座位`, 'conflict', 409, 'R-BK-12');
+      if (lines.length > db.config.maxResources) ruleFail('R-BK-06', `${z.zh}剩下的座位太分散了，请减少人数或换个区域`);
+    }
+    if (lines.length > 1) reasons.push('multi_resource');
+  }
+  if (note) reasons.push('special_note');
+  if (session.confirm_policy === 'all_manual') reasons.push('session_all_manual');
+  if (already.length && z.kind === 'booth') reasons.push('over_required');
+  const tier = resourceOf(lines[0].code).tier;
+  const pr = priceFor(db, tier, member);
+  const deposit = z.kind === 'booth' ? pr.deposit : 0;
+  const tickets = z.kind !== 'booth' && !member ? party : 0;
+  const total = z.kind === 'booth' ? deposit * lines.length : tickets * db.config.ticketPrice;
+  return {
+    session, zone: z, member, party, required, extra, note, explanation, lines, warnings,
+    confirm_mode: reasons.length ? 'manual' : 'instant', manual_reasons: [...new Set(reasons)],
+    price: { min_member: pr.min_member, min_guest: pr.min_guest, deposit_member: pr.deposit_member, deposit_guest: pr.deposit_guest, deposit_each: deposit, tickets, ticket_price: db.config.ticketPrice, ticket_drink: db.config.ticketDrink, total_due: total },
   };
-  if (admin) Object.assign(v, { phone: a.phone, wechat: a.wechat, leadMemberId: a.leadMemberId, leadNo: lead ? lead.no : null, notes: a.notes, invite: a.invite, memberId: a.memberId });
-  return v;
 }
 
-function resView(db, r) {
-  const f = byId(db.floors, r.floorId);
-  const z = f.zones.find(x => x.id === r.zoneId) || {};
-  return { ...r, zone: { id: z.id, zh: z.zh, en: z.en, unit: z.unit }, floor: { id: f.id, floor: f.floor, name: f.name }, sessionInfo: SESSIONS[r.session] };
-}
-
-function bookView(db, b, memberId) {
-  return { id: b.id, title: b.title, author: b.author, lang: b.lang, shelf: b.shelf, color: b.color, status: b.status, mine: !!memberId && b.holderId === memberId, dueAt: b.holderId === memberId ? b.dueAt : null };
-}
+const quoteView = q => ({
+  session_id: q.session.id, zone: q.zone.id, member: q.member, party_size: q.party, required: q.required, units: q.lines.length,
+  seats: q.lines.reduce((s, l) => s + l.seats, 0), extra: q.extra, warnings: q.warnings, confirm_mode: q.confirm_mode, manual_reasons: q.manual_reasons, price: q.price,
+});
 
 /* =========================================================
    Methods
@@ -491,747 +623,1016 @@ function bookView(db, b, memberId) {
 const METHODS = {};
 const def = (name, role, fn) => { METHODS[name] = { role, fn }; };
 
-function log(ctx, kind, text) {
-  ctx.db.activity.unshift({ at: iso(ctx.now), kind, text });
-  ctx.db.activity.length = Math.min(ctx.db.activity.length, 150);
+function log(ctx, action, object_type, object_id, extra = {}) {
+  ctx.db.audit.unshift({ id: 'au' + rid(6), actor: ctx.staff ? ctx.staff.id : ctx.user ? ctx.user.id : 'system', action, object_type, object_id, at: iso(ctx.now), ...extra });
+  ctx.db.audit.length = Math.min(ctx.db.audit.length, 400);
 }
-function notify(ctx, to, kind, title, body = '') {
-  ctx.db.notices.unshift({ id: 'o' + rid(8), to, kind, title, body, at: iso(ctx.now), read: false });
-  ctx.db.notices.length = Math.min(ctx.db.notices.length, 500);
+function notify(ctx, uid, kind, title, body = '') {
+  ctx.db.notices.unshift({ id: 'n' + rid(8), to: uid, kind, title, body, at: iso(ctx.now), read: false });
+  ctx.db.notices.length = Math.min(ctx.db.notices.length, 600);
   ctx.touch('notices');
 }
-function issue(ctx, role, id) {
-  const token = rid(32);
-  ctx.db.sessions[token] = { role, id, at: iso(ctx.now) };
-  const keys = Object.keys(ctx.db.sessions);
-  if (keys.length > 400) keys.sort((a, b) => ctx.db.sessions[a].at.localeCompare(ctx.db.sessions[b].at)).slice(0, keys.length - 400).forEach(k => delete ctx.db.sessions[k]);
+function issue(ctx, kind, id) {
+  const t = rid(32);
+  ctx.db.tokens[t] = { kind, id, at: iso(ctx.now) };
+  const keys = Object.keys(ctx.db.tokens);
+  if (keys.length > 400) keys.sort((a, b) => ctx.db.tokens[a].at.localeCompare(ctx.db.tokens[b].at)).slice(0, keys.length - 400).forEach(k => delete ctx.db.tokens[k]);
   ctx.touch('session');
-  return { token, role };
+  return t;
 }
-const me = ctx => {
-  const m = byId(ctx.db.members, ctx.session.id);
-  if (!m || m.status !== 'active') fail('会员身份不可用，请联系礼宾台', 'auth', 401);
-  return m;
-};
-const staffMe = ctx => byId(ctx.db.staff, ctx.session.id) || ctx.db.staff[2];
-const nextNo = db => String(db.members.reduce((n, m) => Math.max(n, +m.no), 0) + 1).padStart(4, '0');
-const activeApp = (db, phone) => db.applications.filter(a => a.phone === phone && a.stage !== 'declined').sort((a, b) => b.createdAt.localeCompare(a.createdAt))[0];
+const need = (ctx, ...ids) => { const idn = identityOf(ctx.db, ctx.user, ctx.now); if (!ids.includes(idn)) fail(ids.includes('member_active') ? '这是会员功能' : '现在不能这样操作', 'forbidden', 403); return idn; };
+const unlockedKeys = (db, u, t) => (u && identityOf(db, u, t) === 'member_active' ? db.unlocks.filter(x => x.user_id === u.id && !x.revoked_at).map(x => x.key) : []);
+function grant(ctx, u, key, source, by = null) {
+  if (ctx.db.unlocks.some(x => x.user_id === u.id && x.key === key && !x.revoked_at)) return false;
+  ctx.db.unlocks.push({ id: 'ul' + rid(6), user_id: u.id, key, source, granted_by: by, at: iso(ctx.now), revoked_at: null });
+  const item = ctx.db.content.find(c => c.key === key);
+  notify(ctx, u.id, 'unlock', `解锁 · ${item ? item.teaser.title : key}`, item ? item.teaser.hook : '');
+  ctx.touch('content');
+  return true;
+}
+function unlockBy(ctx, u, type) {
+  const n = { checkin_count: ctx.db.checkins.filter(c => c.user_id === u.id).length, event_attended: ctx.db.registrations.filter(r => r.user_id === u.id && r.status === 'attended').length, hosted_session: ctx.db.registrations.filter(r => r.user_id === u.id && r.hosted).length };
+  for (const c of ctx.db.content) if (c.active !== false && c.unlock_rule && c.unlock_rule.type === type && n[type] >= (c.unlock_rule.n || 1)) grant(ctx, u, c.key, type);
+}
+
+function release(ctx, b, reason) {
+  for (const o of ctx.db.occupancies) if (o.booking_id === b.id && !o.released_at) { o.released_at = iso(ctx.now); o.release_reason = reason; }
+  ctx.touch('board');
+}
+function refundFor(ctx, b, reason) {
+  const p = ctx.db.payments.find(x => x.booking_id === b.id && x.status === 'paid');
+  if (!p || ctx.db.refunds.some(r => r.payment_id === p.id)) return null;
+  const r = { id: 'rf' + rid(6), payment_id: p.id, booking_id: b.id, user_id: b.user_id, amount: p.amount, reason, status: 'processing', created_at: iso(ctx.now), settled_at: null };
+  ctx.db.refunds.push(r);
+  ctx.touch('ledger');
+  return r;
+}
+function setStatus(ctx, b, status, extra = {}) {
+  b.status = status;
+  b.history.push({ status, at: iso(ctx.now), ...extra });
+  ctx.touch('bookings');
+}
+
+/* lazy timers (spec 12.2): run before every call, idempotent */
+export function sweep(db, t) {
+  const changed = new Set();
+  const ctx = { db, now: t, touch: (...x) => x.forEach(k => changed.add(k)), staff: null, user: null };
+  for (const b of db.bookings) {
+    if (b.status === 'pending_payment' && t > Date.parse(b.lock_expires_at)) { // T5
+      setStatus(ctx, b, 'payment_expired');
+      release(ctx, b, 'payment_timeout');
+      for (const p of db.payments) if (p.booking_id === b.id && p.status !== 'paid') p.status = 'failed_closed';
+    } else if (b.status === 'pending_confirm' && t > Date.parse(b.confirm_deadline_at)) { // T10
+      setStatus(ctx, b, 'confirm_timeout_closed');
+      release(ctx, b, 'confirm_timeout');
+      const r = refundFor(ctx, b, 'confirm_timeout');
+      notify(ctx, b.user_id, 'booking', '确认超时，订单已关闭', r ? `${yuan(r.amount)} 正在原路退回。` : '桌位已释放。');
+    } else if (b.status === 'confirmed' && t > sessionEnd(db.config, b.date)) { // T14
+      setStatus(ctx, b, 'no_show');
+      release(ctx, b, 'session_closed');
+      for (const k of db.tickets) if (k.booking_id === b.id && k.verification === 'unverified') k.verification = 'expired';
+    }
+  }
+  for (const h of db.holds) if (!h.released_at && t > sessionEnd(db.config, (sessionOf(db, h.session_id) || {}).date || '2000-01-01')) h.released_at = iso(t);
+  for (const r of db.refunds) if (r.status === 'processing' && t - Date.parse(r.created_at) > db.config.refundSettleSeconds * 1000) {
+    r.status = 'succeeded'; r.settled_at = iso(t);
+    ctx.touch('ledger');
+    notify(ctx, r.user_id, 'refund', '退款已到账', `${yuan(r.amount)} 已原路退回。`);
+  }
+  return [...changed];
+}
+
+/* ---------- views ---------- */
+const sessionView = s => s && ({ id: s.id, date: s.date, title: s.title, en: s.en, performers: s.performers, show_start: s.show_start, hold_deadline: s.hold_deadline, status: s.status, reserved: s.reserved, confirm_policy: s.confirm_policy, paused: s.paused });
+function bookingView(db, b, t, admin = false) {
+  const s = sessionOf(db, b.session_id);
+  const pay = db.payments.find(p => p.booking_id === b.id);
+  const ref = db.refunds.find(r => r.booking_id === b.id);
+  const tk = db.tickets.find(k => k.booking_id === b.id);
+  const redeemed = db.redemptions.filter(r => r.booking_id === b.id).reduce((x, r) => x + r.amount, 0);
+  const deposit = pay && pay.kind === 'deposit' && pay.status === 'paid' ? pay.amount : 0;
+  const v = {
+    id: b.id, code: b.code, session: sessionView(s), date: b.date, zone: b.zone, kind: b.kind, party_size: b.party_size, units: b.units,
+    lines: b.status === 'confirmed' || b.status === 'fulfilled' || admin || b.kind === 'seats' ? b.lines.map(l => ({ ...l, name: resourceOf(l.code).card.name })) : [],
+    status: b.status, label: BOOKING_STATUS[b.status], confirm_mode: b.confirm_mode, manual_reasons: b.manual_reasons, note: b.note, explanation: b.explanation,
+    lock_expires_at: b.lock_expires_at, confirm_deadline_at: b.confirm_deadline_at, table_released: b.table_released,
+    reject_reason: b.reject_reason, suggestion: b.suggestion, suggestion_zone: b.suggestion_zone, price: b.price_snapshot, identity_snapshot: b.identity_snapshot,
+    payment: pay ? { status: pay.status, amount: pay.amount, kind: pay.kind, paid_at: pay.paid_at } : null,
+    refund: ref ? { status: ref.status, amount: ref.amount, created_at: ref.created_at, settled_at: ref.settled_at } : null,
+    ticket: tk ? { count: tk.count, drink_redeemed: tk.drink_redeemed, verification: tk.verification } : null,
+    deposit: deposit ? { paid: deposit, redeemed, left: deposit - redeemed, state: b.status === 'no_show' ? 'expired' : redeemed >= deposit ? 'used' : redeemed ? 'partially_used' : b.table_released ? 'valid_tonight_table_released' : 'unused' } : null,
+    created_at: b.created_at, confirmed_at: b.confirmed_at, verified_at: b.verified_at, history: b.history, server_time: iso(t),
+  };
+  if (admin) { const u = userOf(db, b.user_id); v.user = u && { id: u.id, name: u.name, phone: u.phone, member_no: u.member_no }; }
+  return v;
+}
+function eventView(db, e, u, t, layer) {
+  const regs = db.registrations.filter(r => r.event_id === e.id && r.status !== 'cancelled');
+  const mine = u ? regs.find(r => r.user_id === u.id) : null;
+  const locked = e.layer > layer;
+  const base = { id: e.id, kind: e.kind, kindInfo: EVENT_KINDS[e.kind], layer: e.layer, title: e.teaser.title, hook: e.teaser.hook, start_at: e.start_at, end_at: e.end_at, locked, tags: e.tags, status: e.status };
+  if (locked) return base; // INV-11: no body for those who can't see it
+  return { ...base, en: e.en, intro: e.intro, host: e.host, guests: e.guests, location: e.location, capacity: e.capacity, taken: regs.length, left: Math.max(0, e.capacity - regs.length), public_signup: e.public_signup, signup_close_at: e.signup_close_at, mine: mine ? mine.status : null, past: Date.parse(e.end_at) < t };
+}
+function contentBody(db, c, u, t) {
+  if (!c.body.dynamic) return c.body;
+  if (c.body.dynamic === 'shelf') return { books: BOOKS, mine: db.shelf.filter(s => s.user_id === u.id).map(s => ({ ...BOOKS.find(b => b.id === s.book), date: s.date })), borrowed_today: db.shelf.some(s => s.user_id === u.id && s.date === hzDate(t)), checked_in_today: db.checkins.some(c2 => c2.user_id === u.id && c2.date === hzDate(t)) };
+  if (c.body.dynamic === 'recordings') return { items: db.registrations.filter(r => r.user_id === u.id && r.status === 'attended').map(r => { const e = byId(db.events, r.event_id); return { title: e.title, date: hzDate(e.start_at), host: e.host, minutes: 60 + (hash53(e.id) % 50) }; }) };
+  if (c.body.dynamic === 'speakers') return { names: [...new Set(db.registrations.filter(r => r.hosted).map(r => r.user_id))].map(id => { const x = userOf(db, id); const e = db.registrations.filter(r => r.hosted && r.user_id === id).map(r => byId(db.events, r.event_id).title); return { name: x.name, en: x.en, no: x.member_no, talks: e }; }) };
+  return c.body;
+}
+function contentFor(db, u, t, mode) {
+  const idn = identityOf(db, u, t);
+  const keys = unlockedKeys(db, u, t);
+  return db.content.filter(c => c.active !== false).map(c => {
+    if (idn !== 'member_active') {
+      if (c.layer !== 1) return null; // R-LAY-03: L2/L3 are invisible to L0
+      return { key: c.key, layer: 1, mode: c.mode, teaser: c.teaser, locked: true };
+    }
+    if (c.layer <= 1) return { key: c.key, layer: c.layer, mode: c.mode, teaser: c.teaser, locked: false, dim: c.mode !== 'any' && c.mode !== mode };
+    if (keys.includes(c.key)) return { key: c.key, layer: c.layer, mode: c.mode, teaser: c.teaser, locked: false, rule: c.unlock_rule.type };
+    if (c.locked_placeholder) return { key: c.key, layer: c.layer, mode: c.mode, teaser: { title: c.teaser.title, hook: c.teaser.hook }, locked: true, rule: c.unlock_rule.type };
+    return null;
+  }).filter(Boolean);
+}
 
 /* ---------- public ---------- */
-def('ping', 'public', ctx => ({ ok: true, opening: OPENING, now: ctx.now }));
+def('ping', 'public', ctx => ({ ok: true, version: VERSION, now: ctx.now }));
 
-def('club.info', 'public', ctx => ({
-  opening: OPENING,
-  floors: ctx.db.floors.map(f => ({ id: f.id, floor: f.floor, name: f.name, zh: f.zh, note: f.note, status: f.status, state: floorState(f, ctx.now) })),
-  cities: CITIES,
-}));
+def('club.info', 'public', ctx => ({ store: STORE, mode: modeAt(ctx.db.config, ctx.now), now: iso(ctx.now), config: { switchAt: ctx.db.config.switchAt, dayOpenAt: ctx.db.config.dayOpenAt, nightCloseAt: ctx.db.config.nightCloseAt } }));
 
-def('staff.list', 'public', ctx => ctx.db.staff.map(staffView));
+def('staff.list', 'public', ctx => ctx.db.staff.map(s => ({ id: s.id, name: s.name, role: s.role, title: s.title })));
 
 def('auth.login', 'public', (ctx, { phone, code }) => {
   phone = normPhone(phone);
   if (!/^1\d{10}$/.test(phone)) fail('请输入 11 位手机号');
   if (String(code ?? '').trim() !== DEMO_CODE) fail(`验证码不正确（演示验证码：${DEMO_CODE}）`);
-  const m = ctx.db.members.find(x => x.phone === phone);
-  if (m) {
-    if (m.status !== 'active') fail('该会员身份已暂停，请联系礼宾台');
-    return issue(ctx, 'member', m.id);
+  let u = ctx.db.users.find(x => x.phone === phone);
+  if (!u) {
+    u = { id: 'u' + rid(8), name: '', en: '', phone, city: '', company_role: '', intro: '', member_no: null, unlock_seen: false, secret: 'sv-m-' + rid(12), created_at: iso(ctx.now), notices_seen_at: '' };
+    ctx.db.users.push(u);
+    ctx.touch('members');
   }
-  const a = activeApp(ctx.db, phone);
-  if (a) return issue(ctx, 'applicant', a.id);
-  fail('没有找到这个手机号。Something Ventured 仅限推荐入会，可以先提交申请。', 'not_found', 404);
+  return { token: issue(ctx, 'user', u.id) };
 });
 
-def('auth.demo', 'public', (ctx, { as }) => as === 'applicant'
-  ? issue(ctx, 'applicant', (ctx.db.applications.find(a => a.phone === '13900000021') || ctx.db.applications.find(a => a.stage === 'diligence')).id)
-  : issue(ctx, 'member', 'm07'));
-
-def('auth.logout', 'any', ctx => { delete ctx.db.sessions[ctx.token]; ctx.touch('session'); return { ok: true }; });
-
-def('invite.check', 'public', (ctx, { code }) => {
-  const a = ctx.db.applications.find(x => x.invite && x.invite === clean(code, 12).toUpperCase());
-  if (!a || a.stage === 'declined') fail('邀请码无效，请向推荐你的会员确认。', 'not_found', 404);
-  const lead = byId(ctx.db.members, a.leadMemberId);
-  return { name: a.name, venture: a.venture, sector: a.sector, base: a.base, lead: lead ? lead.name : a.lead, completed: a.completed !== false };
+export const PERSONAS = {
+  non_member: '13700000001', applicant: '13900000021', need_info: '13900000024', approved: '13900000031', invitee: '13900000011', member: '13800000007', expired: '13800000015',
+};
+def('auth.demo', 'public', (ctx, { as }) => {
+  const u = ctx.db.users.find(x => x.phone === PERSONAS[as]);
+  if (!u) fail('没有这个演示身份');
+  return { token: issue(ctx, 'user', u.id) };
 });
 
-def('apply', 'public', (ctx, args) => {
-  const db = ctx.db;
-  const v = {
-    name: clean(args.name, 30), venture: clean(args.venture, 60), sector: clean(args.sector, 20), base: clean(args.base, 10),
-    lead: clean(args.lead, 30), phone: normPhone(args.phone), wechat: clean(args.wechat, 40), thesis: cleanText(args.thesis, 300),
+def('auth.logout', 'any', ctx => { delete ctx.db.tokens[ctx.token]; ctx.touch('session'); return { ok: true }; });
+
+/* ---------- user ---------- */
+def('me', 'optional', ctx => {
+  const { db, now, user: u } = ctx;
+  const mode = modeAt(db.config, now);
+  const idn = identityOf(db, u, now);
+  if (!u) return { identity: 'guest', layer: 0, mode, now: iso(now), store: STORE, user: null };
+  const app = latestApp(db, u.id);
+  const inv = heldInvite(db, u, now);
+  return {
+    identity: idn, identityInfo: IDENTITIES[idn], layer: idn === 'member_active' ? 1 : 0, mode, now: iso(now), store: STORE,
+    user: { id: u.id, name: u.name, en: u.en, phone: u.phone.replace(/^(\d{3})\d{4}(\d{4})$/, '$1 **** $2'), member_no: u.member_no, company_role: u.company_role, city: u.city, initials: (u.name || u.phone).slice(0, 1) },
+    secret: idn === 'member_active' ? u.secret : null,
+    membership: membershipView(db, u, now),
+    application: app && app.status !== 'completed' ? { id: app.id, status: app.status, label: APP_STATUS[app.status], profile: app.profile, review_note: app.review_note, history: app.history, price: db.config.memberPrice } : null,
+    invite: inv ? { token: inv.token, note: inv.note, deadline: inv.claim_deadline, months: db.config.giftMonths } : null,
+    unlocked: unlockedKeys(db, u, now),
+    play_unlock: idn === 'member_active' && !u.unlock_seen,
+    unread: db.notices.filter(n => n.to === u.id && !n.read).length,
+    member_price: db.config.memberPrice,
   };
-  if (!v.name) fail('请填写姓名');
-  if (!v.venture) fail('请填写公司与职位');
-  if (!SECTORS.some(s => s.id === v.sector)) fail('请选择领域');
-  if (!BASES.includes(v.base)) fail('请选择常驻城市');
-  if (!/^1\d{10}$/.test(v.phone)) fail('请填写 11 位手机号');
-  if (db.members.some(m => m.phone === v.phone)) fail('这个手机号已经是会员，请直接登录。', 'conflict', 409);
-  const code = clean(args.invite, 12).toUpperCase();
-  let a = code ? db.applications.find(x => x.invite === code && x.stage !== 'declined') : null;
-  if (code && !a) fail('邀请码无效，请向推荐你的会员确认。');
-  const existing = activeApp(db, v.phone);
-  if (existing && existing !== a) fail('这个手机号已经有一份申请在进行中，可以直接登录查看进度。', 'conflict', 409);
-  if (a) {
-    Object.assign(a, { ...v, lead: a.lead, completed: true });
-    log(ctx, 'application', `${a.name} 补全了 ${a.lead} 的推荐信息`);
-  } else {
-    const lead = v.lead ? db.members.find(m => m.name === v.lead) : null;
-    a = {
-      id: 'b' + rid(8), ...v, en: '', leadMemberId: lead ? lead.id : null, source: 'application', invite: null, completed: true,
-      stage: 'received', createdAt: iso(ctx.now), stageAt: iso(ctx.now), initiationAt: null, memberId: null,
-      history: [{ stage: 'received', at: iso(ctx.now) }], notes: [],
+});
+
+def('unlock.seen', 'user', ctx => { ctx.user.unlock_seen = true; ctx.touch('session'); return { ok: true }; });
+
+def('home', 'optional', ctx => {
+  const { db, now, user: u } = ctx;
+  const mode = modeAt(db.config, now);
+  const idn = identityOf(db, u, now);
+  const date = tonightDate(db.config, now);
+  const s = db.sessions.find(x => x.date === date && x.status === 'on_sale') || db.sessions.find(x => x.date > date && x.status === 'on_sale');
+  const states = s ? tableStates(db, s, u, now) : {};
+  const zones = s ? zoneSummary(db, s, u, now, states) : [];
+  const layer = idn === 'member_active' ? 1 : 0;
+  const events = db.events.filter(e => e.status === 'published' && Date.parse(e.end_at) > now).sort((a, b) => a.start_at.localeCompare(b.start_at)).map(e => eventView(db, e, u, now, layer));
+  const out = {
+    mode, now: iso(now), identity: idn, layer, store: STORE,
+    tonight: s ? { session: sessionView(s), zones, ticket_price: db.config.ticketPrice, ticket_drink: db.config.ticketDrink, ticket_sales: db.config.ticketSalesEnabled, release_at: db.config.switchAt, show_start: s.show_start } : null,
+    content: contentFor(db, u, now, mode),
+    events: events.slice(0, 6),
+    switch_at: db.config.switchAt, day_open_at: db.config.dayOpenAt, night_close_at: db.config.nightCloseAt,
+  };
+  if (u) {
+    out.mine = db.bookings.filter(b => b.user_id === u.id && ['pending_payment', 'pending_confirm', 'confirmed'].includes(b.status) && b.date >= date).sort((a, b) => a.date.localeCompare(b.date)).slice(0, 3).map(b => bookingView(db, b, now));
+  }
+  if (layer === 1) {
+    const today = hzDate(now);
+    const ci = db.checkins.find(c => c.user_id === u.id && c.date === today);
+    out.member = {
+      reserved: s ? s.reserved.map(code => ({ code, name: resourceOf(code).card.name, state: states[code].state })) : [],
+      checkin: { today: !!ci, at: ci ? ci.at : null, companions: ci ? ci.companions : 0, here: db.checkins.filter(c => c.date === today).length },
+      meetings: db.meetings.filter(m => m.user_id === u.id && m.date >= today && !['cancelled', 'rejected', 'user_declined'].includes(m.status)).sort((a, b) => (a.date + a.start).localeCompare(b.date + b.start)),
+      roundtables: events.filter(e => e.kind === 'roundtable' && hzDate(e.start_at) === today),
+      unlocked: unlockedKeys(db, u, now),
     };
-    db.applications.push(a);
-    log(ctx, 'application', v.lead ? `${a.name} 经 ${v.lead} 推荐，提交了入会申请` : `${a.name} 提交了入会申请`);
-    if (lead) notify(ctx, lead.id, 'referral', `${a.name} 写下了你的名字`, '他的申请已经送到礼宾台，筛选结果会同步给你。');
   }
-  ctx.touch('applications');
-  return { ...issue(ctx, 'applicant', a.id), application: appView(db, a) };
+  return out;
 });
 
-/* ---------- applicant ---------- */
-def('application.status', 'applicant', ctx => {
-  const a = byId(ctx.db.applications, ctx.session.id);
-  if (!a) fail('申请不存在', 'auth', 401);
-  const notices = ctx.db.notices.filter(n => n.to === 'a:' + a.id).slice(0, 10);
-  // a nominee who has not filled in the form yet needs their own invite code to do so
-  return { application: { ...appView(ctx.db, a), invite: a.completed === false ? a.invite : null }, notices };
+def('sessions.window', 'optional', ctx => {
+  const { db, now, user: u } = ctx;
+  const win = bookingWindow(db, u, now);
+  return { member: win.member, days: win.dates.length, sessions: win.dates.map(d => { const s = db.sessions.find(x => x.date === d); return s ? { ...sessionView(s), past_cutoff: now > Date.parse(atHz(d, db.config.onlineCutoff)) } : { date: d, status: 'none' }; }) };
 });
 
-def('auth.upgrade', 'applicant', ctx => {
-  const a = byId(ctx.db.applications, ctx.session.id);
-  if (!a || a.stage !== 'welcomed' || !a.memberId) fail('入会手续还没有完成');
-  ctx.session.role = 'member';
-  ctx.session.id = a.memberId;
-  ctx.touch('session');
-  return { role: 'member' };
-});
-
-/* ---------- member ---------- */
-function meView(db, m) {
-  const host = byId(db.staff, m.hostId);
+def('session.map', 'optional', (ctx, { session_id }) => {
+  const { db, now, user: u } = ctx;
+  const s = sessionOf(db, session_id);
+  if (!s) fail('找不到这一场', 'not_found', 404);
+  const states = tableStates(db, s, u, now);
   return {
-    ...brief(m), phone: m.phone.replace(/^(\d{3})\d{4}(\d{4})$/, '$1 **** $2'), since: m.since, secret: m.secret,
-    host: staffView(host), cities: CITIES,
-    stats: {
-      visits: db.visits.filter(v => v.memberId === m.id).length,
-      events: db.rsvps.filter(r => r.memberId === m.id && (r.status === 'attended' || r.status === 'going')).length,
-      referrals: db.applications.filter(a => a.leadMemberId === m.id).length,
-    },
+    session: sessionView(s), identity: identityOf(db, u, now), member_on_date: isMemberOn(db, u, s.date), mode: modeAt(db.config, now), now: iso(now),
+    states, zones: zoneSummary(db, s, u, now, states), release_at: atHz(s.date, db.config.switchAt),
+    my_tonight: u ? db.bookings.filter(b => b.user_id === u.id && b.session_id === s.id && ['pending_payment', 'pending_confirm', 'confirmed'].includes(b.status)).reduce((x, b) => x + b.units, 0) : 0,
+    ticket_sales: db.config.ticketSalesEnabled, ticket_price: db.config.ticketPrice, ticket_drink: db.config.ticketDrink, deposit_ratio: db.config.depositRatio, confirm_minutes: db.config.confirmMinutes, lock_minutes: db.config.lockMinutes,
   };
-}
+});
 
-def('me', 'member', ctx => meView(ctx.db, me(ctx)));
+def('booking.quote', 'user', (ctx, args) => quoteView(quote(ctx.db, ctx.user, args, ctx.now)));
 
-def('lobby', 'member', ctx => {
+def('booking.create', 'user', (ctx, args) => {
+  const { db, now, user: u } = ctx;
+  const q = quote(db, u, args, now);
+  const due = q.price.total_due;
+  if (due > 0 && db.bookings.some(b => b.user_id === u.id && b.status === 'pending_payment')) ruleFail('R-BK-07', '你还有一笔待支付的订单，先完成或取消它');
+  const b = {
+    id: 'bk' + rid(8), code: 'LL-' + token(4), user_id: u.id, session_id: q.session.id, date: q.session.date, zone: q.zone.id, kind: q.zone.kind === 'booth' ? 'booth' : 'seats',
+    party_size: q.party, units: q.lines.length, identity_snapshot: q.member ? 'member_active' : identityOf(db, u, now) === 'member_active' ? 'non_member' : identityOf(db, u, now),
+    lines: q.lines, confirm_mode: q.confirm_mode, manual_reasons: q.manual_reasons, note: q.note, explanation: q.explanation, status: 'pending_payment',
+    lock_expires_at: null, confirm_deadline_at: null, table_released: false, reject_reason: '', suggestion: '', suggestion_zone: '',
+    price_snapshot: { lines: q.lines.map(l => ({ code: l.code, deposit: q.price.deposit_each, tickets: q.price.tickets ? l.seats : 0 })), deposit_each: q.price.deposit_each, min_spend_member: q.zone.kind === 'booth' ? q.price.min_member : 0, min_spend_guest: q.zone.kind === 'booth' ? q.price.min_guest : 0, ticket_price: q.price.ticket_price, tickets: q.price.tickets, total_due: due },
+    rules_version: RULES_VERSION, created_at: iso(now), paid_at: null, confirmed_at: null, verified_at: null, history: [],
+  };
+  const occ = kind => q.lines.forEach(l => db.occupancies.push({ id: 'oc' + rid(8), resource: l.code, session_id: b.session_id, booking_id: b.id, kind, seats: b.kind === 'seats' ? l.seats : null, expires_at: kind === 'payment_lock' ? b.lock_expires_at : null, released_at: null, release_reason: null, used_at: null }));
+  if (due > 0) { // T1: lock everything for ten minutes (INV-03: all lines or none — quote already proved they are free)
+    b.lock_expires_at = iso(now + db.config.lockMinutes * MIN);
+    b.history.push({ status: 'pending_payment', at: iso(now) });
+    occ('payment_lock');
+    db.payments.push({ id: 'pm' + rid(6), kind: b.kind === 'booth' ? 'deposit' : 'ticket', user_id: u.id, booking_id: b.id, amount: due, provider: 'mock', status: 'unpaid', created_at: iso(now), expires_at: b.lock_expires_at, paid_at: null });
+  } else if (q.confirm_mode === 'instant') { // T2
+    b.status = 'confirmed'; b.confirmed_at = iso(now);
+    b.history.push({ status: 'confirmed', at: iso(now) });
+    occ('confirmed');
+  } else { // T2b
+    b.status = 'pending_confirm'; b.confirm_deadline_at = iso(now + db.config.confirmMinutes * MIN);
+    b.history.push({ status: 'pending_confirm', at: iso(now) });
+    occ('pending_hold');
+  }
+  db.bookings.push(b);
+  ctx.touch('bookings', 'board');
+  log(ctx, 'booking.create', 'booking', b.id, { reason: `${q.zone.zh} · ${q.party} 人` });
+  return bookingView(db, b, now);
+});
+
+def('booking.pay', 'user', (ctx, { id }) => { // mock payment channel (payment.provider = mock)
   const { db, now } = ctx;
-  const m = me(ctx);
-  const upcoming = [];
-  db.reservations.filter(r => r.memberId === m.id && r.status === 'confirmed' && r.date >= hzDate(now)).forEach(r => {
-    upcoming.push({ kind: 'reservation', at: atHz(r.date, SESSIONS[r.session].from), item: resView(db, r) });
-  });
-  db.rsvps.filter(r => r.memberId === m.id && r.status === 'going').forEach(r => {
-    const e = byId(db.events, r.eventId);
-    if (e && Date.parse(e.endsAt) > now) upcoming.push({ kind: 'event', at: e.startsAt, item: eventView(db, e, m.id, now) });
-  });
-  upcoming.sort((a, b) => a.at.localeCompare(b.at));
-  const spotlight = db.events.filter(e => e.status === 'published' && Date.parse(e.startsAt) > now)
-    .sort((a, b) => a.startsAt.localeCompare(b.startsAt)).slice(0, 3).map(e => eventView(db, e, m.id, now));
-  const unread = db.notices.filter(n => n.to === m.id && !n.read).length + db.bulletins.filter(b => b.at > (m.bulletinSeenAt || '')).length;
-  return {
-    me: meView(db, m),
-    floors: db.floors.map(f => ({ id: f.id, floor: f.floor, name: f.name, zh: f.zh, note: f.note, status: f.status, openingDate: f.openingDate, state: floorState(f, now) })),
-    upcoming: upcoming.slice(0, 3), spotlight, bulletins: db.bulletins.slice(0, 2), unread, opening: OPENING,
-  };
-});
-
-def('events.list', 'member', ctx => {
-  const m = me(ctx);
-  return ctx.db.events.filter(e => e.status === 'published')
-    .map(e => eventView(ctx.db, e, m.id, ctx.now))
-    .sort((a, b) => a.past - b.past || (a.past ? b.startsAt.localeCompare(a.startsAt) : a.startsAt.localeCompare(b.startsAt)));
-});
-
-def('events.rsvp', 'member', (ctx, { eventId }) => {
-  const { db } = ctx;
-  const m = me(ctx);
-  const e = byId(db.events, eventId);
-  if (!e || e.status !== 'published') fail('找不到这场活动', 'not_found', 404);
-  if (Date.parse(e.startsAt) < ctx.now) fail('这场活动已经开始了');
-  let r = db.rsvps.find(x => x.eventId === e.id && x.memberId === m.id);
-  if (r && (r.status === 'going' || r.status === 'waitlist')) return eventView(db, e, m.id, ctx.now);
-  const taken = db.rsvps.filter(x => x.eventId === e.id && x.status === 'going').length;
-  const status = taken >= e.capacity ? 'waitlist' : 'going';
-  if (r) Object.assign(r, { status, createdAt: iso(ctx.now) });
-  else db.rsvps.push(r = { id: 'r' + rid(8), eventId: e.id, memberId: m.id, status, createdAt: iso(ctx.now) });
-  notify(ctx, m.id, 'rsvp', status === 'going' ? `座位已确认 · ${e.title}` : `已加入候补 · ${e.title}`, `${fmtShort(e.startsAt)} · ${e.venue}`);
-  log(ctx, 'rsvp', status === 'going' ? `${m.name} 报名了「${e.title}」` : `${m.name} 加入了「${e.title}」的候补`);
-  ctx.touch('events');
-  return eventView(db, e, m.id, ctx.now);
-});
-
-def('events.cancel', 'member', (ctx, { eventId }) => {
-  const { db } = ctx;
-  const m = me(ctx);
-  const e = byId(db.events, eventId);
-  const r = db.rsvps.find(x => x.eventId === eventId && x.memberId === m.id && (x.status === 'going' || x.status === 'waitlist'));
-  if (!e || !r) fail('没有找到你的报名');
-  const was = r.status;
-  r.status = 'cancelled';
-  if (was === 'going') {
-    const next = db.rsvps.filter(x => x.eventId === e.id && x.status === 'waitlist').sort((a, b) => a.createdAt.localeCompare(b.createdAt))[0];
-    if (next) {
-      next.status = 'going';
-      notify(ctx, next.memberId, 'rsvp', `候补转正 · ${e.title}`, `有位置空出来了。${fmtShort(e.startsAt)} 见。`);
+  const b = db.bookings.find(x => x.id === id && x.user_id === ctx.user.id);
+  if (!b) fail('找不到这笔订单', 'not_found', 404);
+  const p = db.payments.find(x => x.booking_id === b.id);
+  if (p && p.status === 'paid') return bookingView(db, b, now); // R-PAY-06: idempotent
+  if (b.status !== 'pending_payment' && b.status !== 'payment_expired') fail('这笔订单不需要支付');
+  if (b.status === 'payment_expired') { // T6 / T7: the payment arrived after the lock
+    const occ = liveOcc(db, now).filter(o => o.session_id === b.session_id && o.booking_id !== b.id);
+    const clash = b.lines.some(l => { const r = resourceOf(l.code); const taken = occ.filter(o => o.resource === l.code).reduce((s, o) => s + (r.unit === 'whole' ? r.capacity : o.seats), 0); return r.unit === 'whole' ? taken > 0 : taken + l.seats > r.capacity; });
+    p.status = 'paid'; p.paid_at = iso(now); b.paid_at = iso(now);
+    if (clash) {
+      setStatus(ctx, b, 'cancelled', { reason: 'late_payment_conflict' });
+      const r = refundFor(ctx, b, 'late_payment_conflict');
+      notify(ctx, b.user_id, 'booking', '付款晚到，桌位已被订走', `${yuan(r.amount)} 正在原路退回。`);
+      return bookingView(db, b, now);
     }
+    b.lines.forEach(l => db.occupancies.push({ id: 'oc' + rid(8), resource: l.code, session_id: b.session_id, booking_id: b.id, kind: 'pending_hold', seats: b.kind === 'seats' ? l.seats : null, expires_at: null, released_at: null, release_reason: null, used_at: null }));
+  } else {
+    p.status = 'paid'; p.paid_at = iso(now); b.paid_at = iso(now);
   }
-  log(ctx, 'rsvp', `${m.name} 取消了「${e.title}」的${was === 'going' ? '报名' : '候补'}`);
+  const live = db.occupancies.filter(o => o.booking_id === b.id && !o.released_at);
+  if (b.confirm_mode === 'instant') { // T3
+    live.forEach(o => { o.kind = 'confirmed'; o.expires_at = null; });
+    setStatus(ctx, b, 'confirmed'); b.confirmed_at = iso(now);
+    if (b.price_snapshot.tickets) db.tickets.push({ id: 'tk' + rid(6), booking_id: b.id, session_id: b.session_id, user_id: b.user_id, count: b.price_snapshot.tickets, drink_redeemed: false, verification: 'unverified' });
+  } else { // T4
+    live.forEach(o => { o.kind = 'pending_hold'; o.expires_at = null; });
+    b.confirm_deadline_at = iso(now + db.config.confirmMinutes * MIN);
+    setStatus(ctx, b, 'pending_confirm');
+  }
+  ctx.touch('ledger', 'board');
+  return bookingView(db, b, now);
+});
+
+def('booking.abandon', 'user', (ctx, { id }) => {
+  const b = ctx.db.bookings.find(x => x.id === id && x.user_id === ctx.user.id);
+  if (!b || b.status !== 'pending_payment') fail('这笔订单不能取消');
+  setStatus(ctx, b, 'payment_expired', { reason: 'abandoned' });
+  release(ctx, b, 'payment_timeout');
+  for (const p of ctx.db.payments) if (p.booking_id === b.id && p.status !== 'paid') p.status = 'failed_closed';
+  return bookingView(ctx.db, b, ctx.now);
+});
+
+def('booking.withdraw', 'user', ctx => ruleFail('R-PAY-08', '待确认期间撤回的规则老板还没拍板，暂不开放（Q-16）'));
+def('booking.cancel', 'user', ctx => ruleFail('R-PAY-07', '已确认订单的取消与退款规则老板还没拍板，暂不开放（Q-10）'));
+
+def('bookings.mine', 'user', ctx => ctx.db.bookings.filter(b => b.user_id === ctx.user.id).sort((a, b) => b.created_at.localeCompare(a.created_at)).map(b => bookingView(ctx.db, b, ctx.now)));
+def('booking.get', 'user', (ctx, { id }) => {
+  const b = ctx.db.bookings.find(x => x.id === id && x.user_id === ctx.user.id);
+  if (!b) fail('找不到这笔订单', 'not_found', 404);
+  return bookingView(ctx.db, b, ctx.now);
+});
+
+def('events.list', 'optional', ctx => {
+  const { db, now, user: u } = ctx;
+  const layer = identityOf(db, u, now) === 'member_active' ? 1 : 0;
+  return db.events.filter(e => e.status === 'published').map(e => eventView(db, e, u, now, layer))
+    .sort((a, b) => (a.past || false) - (b.past || false) || (a.past ? b.start_at.localeCompare(a.start_at) : a.start_at.localeCompare(b.start_at)));
+});
+def('event.get', 'optional', (ctx, { id }) => {
+  const e = byId(ctx.db.events, id);
+  if (!e) fail('找不到这场活动', 'not_found', 404);
+  return eventView(ctx.db, e, ctx.user, ctx.now, identityOf(ctx.db, ctx.user, ctx.now) === 'member_active' ? 1 : 0);
+});
+def('event.register', 'user', (ctx, { id }) => {
+  const { db, now, user: u } = ctx;
+  const e = byId(db.events, id);
+  if (!e || e.status !== 'published') fail('找不到这场活动', 'not_found', 404);
+  const idn = identityOf(db, u, now);
+  if (e.layer === 1 && idn !== 'member_active') fail('这是会员活动', 'forbidden', 403, 'R-EV-05');
+  if (e.layer === 0 && idn !== 'member_active' && !e.public_signup) ruleFail('R-EV-03', '这场活动暂只对会员开放报名');
+  if (now > Date.parse(e.signup_close_at)) fail('报名已截止');
+  const mine = db.registrations.find(r => r.event_id === e.id && r.user_id === u.id && r.status !== 'cancelled');
+  if (mine) return eventView(db, e, u, now, idn === 'member_active' ? 1 : 0);
+  const taken = db.registrations.filter(r => r.event_id === e.id && r.status !== 'cancelled').length;
+  if (taken >= e.capacity) ruleFail('R-EV-04', '名额已满');
+  db.registrations.push({ id: 'rg' + rid(6), event_id: e.id, user_id: u.id, status: 'registered', hosted: false, created_at: iso(now) });
+  notify(ctx, u.id, 'event', `已报名 · ${e.title}`, '到场时出示会员卡或报名记录。');
   ctx.touch('events');
-  return eventView(db, e, m.id, ctx.now);
+  return eventView(db, e, u, now, idn === 'member_active' ? 1 : 0);
 });
-
-function zoneLoad(db, date, session, zoneId) {
-  return db.reservations.filter(r => r.date === date && r.session === session && r.zoneId === zoneId && (r.status === 'confirmed' || r.status === 'seated'))
-    .reduce((s, r) => s + (r.zoneId === 'study' ? 1 : r.party), 0);
-}
-
-def('reserve.availability', 'member', (ctx, { date }) => {
-  const { db } = ctx;
-  const m = me(ctx);
-  const lib = byId(db.floors, 'library');
-  const range = bookingWindow(db, ctx.now);
-  if (!range.includes(date)) date = range[0];
-  const sessions = Object.values(SESSIONS).map(s => ({
-    ...s,
-    zones: lib.zones.map(z => { const booked = zoneLoad(db, date, s.id, z.id); return { ...z, booked, left: Math.max(0, z.capacity - booked) }; }),
-    mine: db.reservations.filter(r => r.memberId === m.id && r.date === date && r.session === s.id && r.status === 'confirmed').map(r => resView(db, r))[0] || null,
-  }));
-  const busy = range.map(d => {
-    const total = Object.keys(SESSIONS).reduce((s, sid) => s + lib.zones.filter(z => z.unit === 'seat').reduce((t, z) => t + zoneLoad(db, d, sid, z.id), 0), 0);
-    return { date: d, load: total / (2 * lib.zones.filter(z => z.unit === 'seat').reduce((t, z) => t + z.capacity, 0)), mine: db.reservations.some(r => r.memberId === m.id && r.date === d && r.status === 'confirmed') };
-  });
-  return { date, range: busy, floor: { id: lib.id, floor: lib.floor, name: lib.name, status: lib.status, openingDate: lib.openingDate }, sessions };
-});
-
-def('reserve.create', 'member', (ctx, { date, session, zoneId, party, note }) => {
-  const { db } = ctx;
-  const m = me(ctx);
-  const lib = byId(db.floors, 'library');
-  if (!['preopening', 'open'].includes(lib.status)) fail('Library 暂停预订');
-  if (!bookingWindow(db, ctx.now).includes(date)) fail('只能预订未来两周内的座位');
-  if (!SESSIONS[session]) fail('请选择时段');
-  const zone = lib.zones.find(z => z.id === zoneId);
-  if (!zone) fail('请选择区域');
-  party = Math.max(1, Math.min(4, parseInt(party, 10) || 1));
-  if (session === 'day' && zone.unit === 'seat') party = 1;
-  const units = zone.unit === 'room' ? 1 : party;
-  if (zoneLoad(db, date, session, zone.id) + units > zone.capacity) fail(`${zone.zh}在这个时段已经订满了`, 'full', 409);
-  if (db.reservations.some(r => r.memberId === m.id && r.date === date && r.session === session && r.status === 'confirmed')) fail('这个时段你已经有一个预订了');
-  const n = db.reservations.length + 1;
-  const r = { id: 'q' + rid(8), code: resCode(date, n), memberId: m.id, floorId: 'library', date, session, zoneId: zone.id, party, note: cleanText(note, 120), status: 'confirmed', createdAt: iso(ctx.now) };
-  db.reservations.push(r);
-  notify(ctx, m.id, 'reservation', `预订成功 · ${zone.zh}`, `${date.slice(5).replace('-', '.')} ${SESSIONS[session].zh} · ${r.code}`);
-  log(ctx, 'reservation', `${m.name} 预订了 ${date.slice(5).replace('-', '.')} ${session === 'day' ? '白天' : '夜晚'} · ${zone.zh}`);
-  ctx.touch('reservations');
-  return resView(db, r);
-});
-
-def('reserve.cancel', 'member', (ctx, { id }) => {
-  const m = me(ctx);
-  const r = ctx.db.reservations.find(x => x.id === id && x.memberId === m.id);
-  if (!r || r.status !== 'confirmed') fail('没有找到这个预订');
+def('event.cancel', 'user', (ctx, { id }) => {
+  const r = ctx.db.registrations.find(x => x.event_id === id && x.user_id === ctx.user.id && x.status === 'registered');
+  if (!r) fail('没有找到你的报名');
   r.status = 'cancelled';
-  log(ctx, 'reservation', `${m.name} 取消了 ${r.date.slice(5).replace('-', '.')} 的预订`);
-  ctx.touch('reservations');
-  return resView(ctx.db, r);
+  ctx.touch('events');
+  return eventView(ctx.db, byId(ctx.db.events, id), ctx.user, ctx.now, identityOf(ctx.db, ctx.user, ctx.now) === 'member_active' ? 1 : 0);
 });
 
-def('reserve.mine', 'member', ctx => {
-  const m = me(ctx);
-  const today = hzDate(ctx.now);
-  return ctx.db.reservations.filter(r => r.memberId === m.id && r.status !== 'cancelled')
-    .map(r => ({ ...resView(ctx.db, r), past: r.date < today }))
-    .sort((a, b) => a.past - b.past || a.date.localeCompare(b.date));
+def('content.list', 'optional', ctx => contentFor(ctx.db, ctx.user, ctx.now, modeAt(ctx.db.config, ctx.now)));
+def('content.get', 'optional', (ctx, { key }) => {
+  const { db, now, user: u } = ctx;
+  const c = db.content.find(x => x.key === key && x.active !== false);
+  if (!c) fail('找不到这一页', 'not_found', 404);
+  const idn = identityOf(db, u, now);
+  if (idn !== 'member_active') {
+    if (c.layer !== 1) fail('找不到这一页', 'not_found', 404); // INV-11 / R-LAY-03
+    return { key: c.key, layer: c.layer, teaser: c.teaser, locked: true };
+  }
+  if (c.layer >= 2 && !unlockedKeys(db, u, now).includes(c.key)) {
+    if (!c.locked_placeholder) fail('找不到这一页', 'not_found', 404);
+    return { key: c.key, layer: c.layer, teaser: c.teaser, locked: true, rule: c.unlock_rule.type };
+  }
+  return { key: c.key, layer: c.layer, mode: c.mode, teaser: c.teaser, locked: false, body: contentBody(db, c, u, now) };
+});
+def('egg.trigger', 'user', (ctx, { key }) => {
+  const { db, now, user: u } = ctx;
+  need(ctx, 'member_active');
+  const c = db.content.find(x => x.unlock_rule && x.unlock_rule.type === 'easter_egg' && x.unlock_rule.egg_key === key);
+  if (!c) fail('没有发生什么。');
+  if (key === 'ink') { const x = hz(now); if (!(x.h >= 23 || x.h < 2)) fail('墨水还没有显影。23:00 以后再看看。'); }
+  const fresh = grant(ctx, u, c.key, 'easter_egg');
+  return { key: c.key, fresh, title: c.teaser.title };
 });
 
-def('books.list', 'member', ctx => {
-  const m = me(ctx);
-  return ctx.db.books.map(b => bookView(ctx.db, b, m.id));
-});
-
-def('books.hold', 'member', (ctx, { id }) => {
-  const m = me(ctx);
-  const b = byId(ctx.db.books, id);
-  if (!b) fail('找不到这本书', 'not_found', 404);
-  if (b.holderId === m.id) return bookView(ctx.db, b, m.id);
-  if (b.status !== 'shelf') fail('这本书已经被预留或借出');
-  if (ctx.db.books.filter(x => x.holderId === m.id).length >= 3) fail('每位会员最多同时预留或借阅 3 本');
-  Object.assign(b, { status: 'held', holderId: m.id, heldAt: iso(ctx.now) });
-  log(ctx, 'book', `${m.name} 预留了《${b.title}》`);
-  ctx.touch('books');
-  return bookView(ctx.db, b, m.id);
-});
-
-def('books.release', 'member', (ctx, { id }) => {
-  const m = me(ctx);
-  const b = byId(ctx.db.books, id);
-  if (!b || b.holderId !== m.id || b.status !== 'held') fail('只能取消自己的预留');
-  Object.assign(b, { status: 'shelf', holderId: null, heldAt: null });
-  ctx.touch('books');
-  return bookView(ctx.db, b, m.id);
-});
-
-def('referral.nominate', 'member', (ctx, args) => {
-  const { db } = ctx;
-  const m = me(ctx);
-  const name = clean(args.name, 30), phone = normPhone(args.phone), venture = clean(args.venture, 60), note = cleanText(args.note, 300);
-  const sector = SECTORS.some(s => s.id === args.sector) ? args.sector : 'Frontier';
-  if (!name) fail('请填写被推荐人的姓名');
-  if (!/^1\d{10}$/.test(phone)) fail('请填写 11 位手机号');
-  if (db.members.some(x => x.phone === phone)) fail('这位已经是会员了');
-  if (activeApp(db, phone)) fail('这位已经有一份申请在进行中');
-  const open = db.applications.filter(a => a.leadMemberId === m.id && ['received', 'diligence'].includes(a.stage)).length;
-  if (open >= 5) fail('你同时在途的推荐最多 5 位');
-  let invite;
-  do { invite = inviteCode(); } while (db.applications.some(a => a.invite === invite));
-  const a = {
-    id: 'b' + rid(8), name, en: '', venture: venture || '待补充', sector, base: m.base, phone, wechat: '', thesis: '', lead: m.name, leadMemberId: m.id,
-    source: 'nomination', invite, completed: false, stage: 'received', createdAt: iso(ctx.now), stageAt: iso(ctx.now), initiationAt: null, memberId: null,
-    history: [{ stage: 'received', at: iso(ctx.now) }], notes: note ? [{ at: iso(ctx.now), by: m.name + '（推荐人）', text: note }] : [],
-  };
-  db.applications.push(a);
-  log(ctx, 'application', `${m.name} 推荐了 ${name}`);
-  ctx.touch('applications');
-  return { invite, application: appView(db, a) };
-});
-
-def('referral.mine', 'member', ctx => {
-  const m = me(ctx);
-  return ctx.db.applications.filter(a => a.leadMemberId === m.id).sort((a, b) => b.createdAt.localeCompare(a.createdAt))
-    .map(a => ({ ...appView(ctx.db, a), invite: a.invite }));
-});
-
-def('concierge.request', 'member', (ctx, { type, text }) => {
-  const m = me(ctx);
-  if (!REQUEST_TYPES[type]) fail('请选择需要什么帮助');
-  text = cleanText(text, 300);
-  if (!text) fail('写一句话告诉我们需要什么');
-  const r = { id: 'c' + rid(8), memberId: m.id, type, text, status: 'open', createdAt: iso(ctx.now), reply: null, repliedAt: null, repliedBy: null };
-  ctx.db.requests.unshift(r);
-  log(ctx, 'request', `${m.name} 按铃：${REQUEST_TYPES[type].zh}`);
-  ctx.touch('requests');
-  return r;
-});
-
-def('concierge.mine', 'member', ctx => {
-  const m = me(ctx);
-  return ctx.db.requests.filter(r => r.memberId === m.id).map(r => ({ ...r, by: staffView(byId(ctx.db.staff, r.repliedBy)) }));
-});
-
-def('notices.list', 'member', ctx => {
-  const m = me(ctx);
-  const seen = m.bulletinSeenAt || '';
-  const items = [
-    ...ctx.db.bulletins.map(b => ({ id: b.id, kind: 'bulletin', title: b.title, body: b.body, at: b.at, read: b.at <= seen, by: staffView(byId(ctx.db.staff, b.by)) })),
-    ...ctx.db.notices.filter(n => n.to === m.id),
-  ];
-  return items.sort((a, b) => b.at.localeCompare(a.at)).slice(0, 40);
-});
-
-def('notices.read', 'member', ctx => {
-  const m = me(ctx);
-  m.bulletinSeenAt = iso(ctx.now);
-  ctx.db.notices.forEach(n => { if (n.to === m.id) n.read = true; });
-  ctx.touch('session');
+def('shelf.borrow', 'user', (ctx, { id }) => {
+  const { db, now, user: u } = ctx;
+  need(ctx, 'member_active');
+  if (!unlockedKeys(db, u, now).includes('shelf')) fail('白天签到一次后解锁', 'forbidden', 403);
+  const today = hzDate(now);
+  if (!db.checkins.some(c => c.user_id === u.id && c.date === today)) fail('今天先签到，再借书');
+  if (db.shelf.some(s => s.user_id === u.id && s.date === today)) fail('今天已经借过一本了');
+  if (!BOOKS.find(b => b.id === id)) fail('找不到这本书');
+  db.shelf.push({ id: 'sh' + rid(6), user_id: u.id, book: id, date: today, at: iso(now) });
+  ctx.touch('content');
   return { ok: true };
 });
 
-def('visits.mine', 'member', ctx => {
-  const m = me(ctx);
-  return ctx.db.visits.filter(v => v.memberId === m.id).sort((a, b) => b.at.localeCompare(a.at))
-    .map(v => ({ ...v, event: v.eventId ? (e => e && { id: e.id, title: e.title, color: e.color })(byId(ctx.db.events, v.eventId)) : null }));
+/* ---------- day: check-in and meetings ---------- */
+def('checkin.today', 'user', ctx => {
+  const { db, now, user: u } = ctx;
+  const today = hzDate(now);
+  const ci = db.checkins.find(c => c.user_id === u.id && c.date === today);
+  const here = db.checkins.filter(c => c.date === today);
+  const rt = db.events.filter(e => e.kind === 'roundtable' && hzDate(e.start_at) === today && Date.parse(e.end_at) > now).sort((a, b) => a.start_at.localeCompare(b.start_at))[0];
+  const people = here.reduce((s, c) => s + 1 + c.companions, 0);
+  return {
+    mode: modeAt(db.config, now), date: today, checked_in: !!ci, at: ci ? ci.at : null, companions: ci ? ci.companions : 0,
+    status: `今天 ${here.length} 位会员签到，${people} 人在座。${rt ? `${hz(rt.start_at).h}:${String(hz(rt.start_at).mi).padStart(2, '0')} 有一场「${rt.title}」。` : '今天没有排座谈，适合读书。'}${people > 30 ? '有点热闹。' : '很安静。'}`,
+    demo_code: checkinCode(db, today), // demo helper: stands in for scanning the code at the door
+  };
+});
+def('checkin.submit', 'user', (ctx, { code, companions }) => {
+  const { db, now, user: u } = ctx;
+  need(ctx, 'member_active');
+  if (modeAt(db.config, now) !== 'day') ruleFail('R-DAY-04', `签到码只在白天（${db.config.dayOpenAt}–${db.config.switchAt}）有效`);
+  const today = hzDate(now);
+  if (String(code || '').trim().toUpperCase() !== checkinCode(db, today)) ruleFail('R-DAY-04', '签到码不对，以门口今天的图案为准');
+  const exists = db.checkins.find(c => c.user_id === u.id && c.date === today);
+  if (exists) return { repeat: true, at: exists.at, companions: exists.companions };
+  const n = Math.max(0, Math.min(20, parseInt(companions, 10) || 0));
+  db.checkins.push({ id: 'ci' + rid(6), user_id: u.id, date: today, at: iso(now), companions: n });
+  ctx.touch('checkins');
+  unlockBy(ctx, u, 'checkin_count');
+  return { repeat: false, at: iso(now), companions: n, unlocked: unlockedKeys(db, u, now) };
 });
 
-/* ---------- staff (admin) ---------- */
+function meetingCheck(db, args, t) {
+  const date = clean(args.date, 10), start = clean(args.start, 5), end = clean(args.end, 5);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date) || !/^\d{2}:\d{2}$/.test(start) || !/^\d{2}:\d{2}$/.test(end)) fail('请填写日期和时间');
+  const today = hzDate(t);
+  if (date < today || daysBetween(today, date) > 14) fail('可以申请两周内的会议');
+  if (mins(start) < mins(db.config.dayOpenAt)) fail(`白天 ${db.config.dayOpenAt} 开门`);
+  if (mins(end) <= mins(start)) fail('结束时间要晚于开始时间');
+  if (mins(end) > mins(db.config.switchAt)) ruleFail('R-DAY-06', `会议不能跨过 ${db.config.switchAt}，那时这里要变成演出现场`);
+  return { date, start, end };
+}
+def('meeting.create', 'user', (ctx, args) => {
+  const { db, now, user: u } = ctx;
+  need(ctx, 'member_active');
+  const v = meetingCheck(db, args, now);
+  const party = parseInt(args.party_size, 10);
+  if (!(party >= 2 && party <= 30)) fail('人数在 2 到 30 之间');
+  const m = { id: 'mt' + rid(6), user_id: u.id, ...v, party_size: party, needs: cleanText(args.needs, 200), status: 'submitted', counter: null, reply: '', created_at: iso(now) };
+  db.meetings.push(m);
+  ctx.touch('meetings');
+  return m;
+});
+def('meeting.respond', 'user', (ctx, { id, accept }) => {
+  const m = ctx.db.meetings.find(x => x.id === id && x.user_id === ctx.user.id);
+  if (!m || m.status !== 'counter_proposed') fail('这条申请不需要你确认');
+  if (accept) { m.start = m.counter.start; m.end = m.counter.end; m.status = 'user_accepted'; } else m.status = 'user_declined';
+  ctx.touch('meetings');
+  return m;
+});
+def('meeting.cancel', 'user', (ctx, { id }) => {
+  const m = ctx.db.meetings.find(x => x.id === id && x.user_id === ctx.user.id);
+  if (!m || ['cancelled', 'rejected', 'user_declined'].includes(m.status)) fail('这条申请不能取消');
+  if (ctx.now > Date.parse(atHz(m.date, m.start))) fail('会议已经开始了');
+  m.status = 'cancelled';
+  ctx.touch('meetings');
+  return m;
+});
+def('meetings.mine', 'user', ctx => ctx.db.meetings.filter(m => m.user_id === ctx.user.id).sort((a, b) => b.created_at.localeCompare(a.created_at)));
+
+/* ---------- membership: apply, invites, renew ---------- */
+const profileOf = (a, u) => {
+  const p = {
+    name: clean(a.name, 30), phone: normPhone(a.phone || u.phone), city: clean(a.city, 20), company_role: clean(a.company_role, 60), intro: cleanText(a.intro, 300), referrer: clean(a.referrer, 30),
+  };
+  if (!p.name) fail('请填写姓名或称呼');
+  if (!/^1\d{10}$/.test(p.phone)) fail('请填写 11 位手机号');
+  if (!p.city) fail('请填写所在城市');
+  if (!p.company_role) fail('请填写公司 / 项目与角色');
+  return p;
+};
+def('application.submit', 'user', (ctx, args) => {
+  const { db, now, user: u } = ctx;
+  const idn = identityOf(db, u, now);
+  if (idn === 'member_active') fail('你已经是会员了');
+  if (idn === 'applicant') fail('你已经有一份申请在审核中');
+  const p = profileOf(args, u);
+  Object.assign(u, { name: u.name || p.name, city: p.city, company_role: p.company_role, intro: p.intro });
+  const a = { id: 'ap' + rid(6), user_id: u.id, status: 'under_review', profile: p, history: [{ status: 'under_review', at: iso(now) }], reviewer: null, review_note: '', created_at: iso(now), updated_at: iso(now) };
+  db.applications.push(a);
+  ctx.touch('applications');
+  log(ctx, 'application.submit', 'application', a.id);
+  return { status: a.status };
+});
+def('application.update', 'user', (ctx, args) => {
+  const a = latestApp(ctx.db, ctx.user.id);
+  if (!a || a.status !== 'need_info') fail('现在不需要补充资料');
+  a.profile = profileOf(args, ctx.user);
+  a.status = 'under_review'; a.updated_at = iso(ctx.now);
+  a.history.push({ status: 'under_review', at: iso(ctx.now), note: '已补充资料' });
+  ctx.touch('applications');
+  return { status: a.status };
+});
+function addSegment(ctx, u, source, extra = {}) {
+  const { db, now } = ctx;
+  const cur = activeSeg(db, u.id, now);
+  const curEnd = cur ? segsOf(db, u.id).reduce((e, s) => (s.end_at > e ? s.end_at : e), cur.end_at) : null;
+  const start = curEnd ? Date.parse(curEnd) + 1000 : now;
+  const months = source === 'gift' ? db.config.giftMonths : 1;
+  const endDate = addMonths(curEnd ? hzDate(curEnd) : hzDate(now), months);
+  if (!u.member_no) u.member_no = String(db.nextNo++).padStart(4, '0');
+  const seg = { id: 'ms' + rid(6), user_id: u.id, source, start_at: iso(start), end_at: atHz(endDate, '23:59:59'), ...extra };
+  db.memberships.push(seg);
+  ctx.touch('members');
+  return seg;
+}
+def('application.pay', 'user', ctx => { // mock payment for the first month
+  const { db, now, user: u } = ctx;
+  const a = latestApp(db, u.id);
+  if (!a || a.status !== 'approved_awaiting_payment') fail('申请还没有通过审核');
+  const p = { id: 'pm' + rid(6), kind: 'membership', user_id: u.id, application_id: a.id, amount: db.config.memberPrice, provider: 'mock', status: 'paid', created_at: iso(now), paid_at: iso(now) };
+  db.payments.push(p);
+  a.status = 'completed'; a.updated_at = iso(now); a.history.push({ status: 'completed', at: iso(now) });
+  const seg = addSegment(ctx, u, 'paid', { payment_id: p.id });
+  notify(ctx, u.id, 'member', `欢迎，No.${u.member_no}`, `会员有效期至 ${hzDate(seg.end_at)}。`);
+  log(ctx, 'membership.paid', 'user', u.id);
+  ctx.touch('applications', 'ledger');
+  return { ok: true, member_no: u.member_no, end_at: seg.end_at };
+});
+def('invite.view', 'optional', (ctx, { token: tk }) => {
+  const { db, now, user: u } = ctx;
+  const inv = db.invites.find(i => i.token === String(tk || '').trim().toUpperCase());
+  if (!inv) fail('这张邀请不存在', 'not_found', 404);
+  const expired = inv.status === 'issued' && Date.parse(inv.claim_deadline) < now;
+  if (u && inv.status === 'issued' && !expired && !inv.held_by && (!inv.bound_phone || inv.bound_phone === u.phone) && identityOf(db, u, now) !== 'member_active') { inv.held_by = u.id; ctx.touch('session'); }
+  return { token: inv.token, note: inv.note, deadline: inv.claim_deadline, months: db.config.giftMonths, status: expired ? 'expired' : inv.status, mine: !!u && inv.claimed_by === u.id, bound: !!inv.bound_phone, for_me: !inv.bound_phone || (u && inv.bound_phone === u.phone) };
+});
+def('invite.claim', 'user', (ctx, { token: tk }) => {
+  const { db, now, user: u } = ctx;
+  const inv = db.invites.find(i => i.token === String(tk || '').trim().toUpperCase());
+  if (!inv) fail('这张邀请不存在', 'not_found', 404);
+  if (inv.claimed_by === u.id) return { ok: true, repeat: true }; // A01: idempotent
+  if (inv.status !== 'issued') fail(inv.status === 'claimed' ? '这张邀请已经被领取了' : '这张邀请已停用');
+  if (Date.parse(inv.claim_deadline) < now) fail('这张邀请已过领取期');
+  if (inv.bound_phone && inv.bound_phone !== u.phone) fail('这张邀请是给另一位朋友的');
+  if (identityOf(db, u, now) === 'member_active') fail('你已经是会员了');
+  inv.status = 'claimed'; inv.claimed_by = u.id; inv.claimed_at = iso(now);
+  const seg = addSegment(ctx, u, 'gift', { invite_id: inv.id });
+  notify(ctx, u.id, 'member', `欢迎，No.${u.member_no}`, `赠送的 ${db.config.giftMonths} 个月会员从今天开始，至 ${hzDate(seg.end_at)}。`);
+  log(ctx, 'invite.claim', 'invite', inv.id);
+  ctx.touch('invites');
+  return { ok: true, member_no: u.member_no, end_at: seg.end_at };
+});
+def('membership.renew', 'user', ctx => {
+  const { db, now, user: u } = ctx;
+  const mv = membershipView(db, u, now);
+  if (!mv) fail('还不是会员');
+  if (!mv.can_renew) fail(`到期超过 ${db.config.renewWithoutReviewDays} 天，需要重新申请`);
+  const p = { id: 'pm' + rid(6), kind: 'membership', user_id: u.id, amount: db.config.memberPrice, provider: 'mock', status: 'paid', created_at: iso(now), paid_at: iso(now) };
+  db.payments.push(p);
+  const seg = addSegment(ctx, u, 'paid', { payment_id: p.id });
+  notify(ctx, u.id, 'member', '续费成功', `有效期至 ${hzDate(seg.end_at)}。`);
+  ctx.touch('ledger');
+  return { ok: true, end_at: seg.end_at };
+});
+
+def('notices.list', 'user', ctx => ctx.db.notices.filter(n => n.to === ctx.user.id).slice(0, 40));
+def('notices.read', 'user', ctx => { ctx.db.notices.forEach(n => { if (n.to === ctx.user.id) n.read = true; }); ctx.touch('session'); return { ok: true }; });
+
+/* =========================================================
+   Back office
+   ========================================================= */
+const adminOnly = ctx => { if (ctx.staff.role !== 'admin') fail('这一步需要店长权限', 'forbidden', 403); };
+const userBrief = (db, u, t) => u && ({ id: u.id, name: u.name || '（未填写）', en: u.en, phone: u.phone, member_no: u.member_no, identity: identityOf(db, u, t) });
+
 def('admin.login', 'public', (ctx, { staffId, pin }) => {
   const s = byId(ctx.db.staff, staffId);
   if (!s) fail('请选择你的名字');
   if (String(pin ?? '').trim() !== DEMO_PIN) fail(`PIN 不正确（演示 PIN：${DEMO_PIN}）`);
-  return { ...issue(ctx, 'admin', s.id), staff: staffView(s) };
+  return { token: issue(ctx, 'staff', s.id), staff: s };
 });
+def('admin.me', 'staff', ctx => ctx.staff);
 
-def('admin.me', 'admin', ctx => staffView(staffMe(ctx)));
-
-def('admin.badges', 'admin', ctx => ({
-  received: ctx.db.applications.filter(a => a.stage === 'received').length,
-  openRequests: ctx.db.requests.filter(r => r.status === 'open').length,
-  holds: ctx.db.books.filter(b => b.status === 'held').length,
-}));
-
-/* Demo helper for the front desk: the door code a demo member's phone is showing right now,
-   so the check-in can be tried on one laptop. A production build would not expose this. */
-def('admin.democode', 'admin', ctx => {
-  const m = byId(ctx.db.members, 'm07') || ctx.db.members[0];
-  return { member: brief(m), code: entryCode(m.secret, ctx.now), ttl: Math.ceil((CODE_STEP - (ctx.now % CODE_STEP)) / 1000) };
-});
-
-def('admin.overview', 'admin', ctx => {
-  const { db, now } = ctx;
-  const today = hzDate(now);
-  const active = db.members.filter(m => m.status === 'active');
-  const lib = byId(db.floors, 'library');
-  const seatZones = lib.zones.filter(z => z.unit === 'seat');
-  const seatCap = seatZones.reduce((s, z) => s + z.capacity, 0);
-  const week = Array.from({ length: 7 }, (_, i) => addDays(lib.openingDate && lib.openingDate > today ? lib.openingDate : today, i));
-  const heat = Object.values(SESSIONS).map(s => ({
-    session: s.id, zh: s.zh, en: s.en,
-    cells: week.map(d => ({ date: d, booked: seatZones.reduce((t, z) => t + zoneLoad(db, d, s.id, z.id), 0), capacity: seatCap })),
-  }));
-  // applications received per week, last 12 weeks (weeks start on Monday, Hangzhou time)
-  const dow = (hz(now).dow + 6) % 7;
-  const thisMonday = addDays(today, -dow);
-  const weekly = Array.from({ length: 12 }, (_, i) => {
-    const start = addDays(thisMonday, (i - 11) * 7), end = addDays(start, 7);
-    return { start, count: db.applications.filter(a => { const d = hzDate(a.createdAt); return d >= start && d < end; }).length };
-  });
-  const pipeline = Object.fromEntries(STAGES.map(s => [s.id, db.applications.filter(a => a.stage === s.id).length]));
-  const upcoming = db.events.filter(e => e.status === 'published' && Date.parse(e.endsAt) > now)
-    .sort((a, b) => a.startsAt.localeCompare(b.startsAt)).slice(0, 5).map(e => eventView(db, e, null, now));
-  const monthStart = addDays(today, -30);
+def('admin.badges', 'staff', ctx => {
+  const { db } = ctx;
   return {
+    confirms: db.bookings.filter(b => b.status === 'pending_confirm').length,
+    reviews: db.applications.filter(a => a.status === 'under_review').length,
+    meetings: db.meetings.filter(m => m.status === 'submitted').length,
+    refunds: db.refunds.filter(r => r.status !== 'succeeded').length,
+  };
+});
+def('admin.workbench', 'staff', ctx => {
+  const { db, now } = ctx;
+  const date = tonightDate(db.config, now);
+  const s = db.sessions.find(x => x.date === date);
+  const today = hzDate(now);
+  const pending = db.bookings.filter(b => b.status === 'pending_confirm').sort((a, b) => a.confirm_deadline_at.localeCompare(b.confirm_deadline_at)).map(b => bookingView(db, b, now, true));
+  const arrivals = s ? db.bookings.filter(b => b.session_id === s.id && ['confirmed', 'fulfilled'].includes(b.status)).map(b => bookingView(db, b, now, true)) : [];
+  return {
+    mode: modeAt(db.config, now), now: iso(now), session: sessionView(s),
+    times: { switch_at: db.config.switchAt, day_open_at: db.config.dayOpenAt, night_close_at: db.config.nightCloseAt, online_cutoff: db.config.onlineCutoff, hold_deadline: db.config.holdDeadline },
     kpis: {
-      members: active.length,
-      newMembers: active.filter(m => m.since > monthStart).length,
-      pipeline: pipeline.received + pipeline.diligence + pipeline.initiation,
-      received: pipeline.received,
-      openRequests: db.requests.filter(r => r.status === 'open').length,
-      holds: db.books.filter(b => b.status === 'held').length,
-      weekSeats: heat.reduce((s, r) => s + r.cells.reduce((t, c) => t + c.booked, 0), 0),
-      weekCapacity: seatCap * 14,
-      daysToOpening: Math.max(0, daysBetween(today, lib.openingDate || OPENING)),
-      visitsToday: db.visits.filter(v => hzDate(v.at) === today).length,
+      reviews: db.applications.filter(a => ['under_review'].includes(a.status)).length,
+      confirms: pending.length, arrivals: arrivals.length, arrived: arrivals.filter(b => b.status === 'fulfilled').length,
+      meetings: db.meetings.filter(m => m.status === 'submitted').length,
+      refunds: db.refunds.filter(r => r.status !== 'succeeded').length,
+      checkins: db.checkins.filter(c => c.date === today).length,
+      members: db.users.filter(u => identityOf(db, u, now) === 'member_active').length,
     },
-    pipeline, weekly,
-    sectors: SECTORS.map(s => ({ id: s.id, en: s.en, zh: s.zh, count: active.filter(m => m.sector === s.id).length })),
-    heat, upcoming,
-    floors: db.floors.map(f => ({ ...f, zones: undefined, state: floorState(f, now) })),
-    activity: db.activity.slice(0, 12),
+    pending, arrivals,
+    zones: s ? zoneSummary(db, s, null, now, tableStates(db, s, null, now, { admin: true })) : [],
+    reviews: db.applications.filter(a => ['under_review', 'need_info'].includes(a.status)).sort((a, b) => a.created_at.localeCompare(b.created_at)).map(a => ({ id: a.id, status: a.status, profile: a.profile, created_at: a.created_at })),
+    meetings: db.meetings.filter(m => ['submitted', 'counter_proposed'].includes(m.status)).map(m => ({ ...m, user: userBrief(db, userOf(db, m.user_id), now) })),
+    events: db.events.filter(e => hzDate(e.start_at) === today).map(e => ({ id: e.id, title: e.title, start_at: e.start_at, taken: db.registrations.filter(r => r.event_id === e.id && r.status !== 'cancelled').length, capacity: e.capacity })),
+    refunds: db.refunds.filter(r => r.status !== 'succeeded').map(r => ({ ...r, user: userBrief(db, userOf(db, r.user_id), now) })),
+    audit: db.audit.slice(0, 8),
   };
 });
 
-def('admin.applications', 'admin', ctx => ctx.db.applications.map(a => appView(ctx.db, a, true)).sort((a, b) => b.stageAt.localeCompare(a.stageAt)));
-
-def('admin.application.move', 'admin', (ctx, { id, stage, initiationAt, note }) => {
-  const { db } = ctx;
-  const a = byId(db.applications, id);
-  const s = staffMe(ctx);
-  if (!a) fail('找不到这份申请', 'not_found', 404);
-  if (!STAGES.some(x => x.id === stage)) fail('未知的阶段');
-  if (a.stage === 'welcomed') fail('已入会的申请不能再移动');
-  if (a.stage === stage) return appView(db, a, true);
-  if (stage === 'initiation') {
-    const t = Date.parse(initiationAt || a.initiationAt || '');
-    if (!t) fail('请先定好入会仪式的时间');
-    a.initiationAt = iso(t);
-  }
-  a.stage = stage;
-  a.stageAt = iso(ctx.now);
-  a.history.push({ stage, at: iso(ctx.now), by: s.name });
-  if (note) a.notes.push({ at: iso(ctx.now), by: s.name, text: cleanText(note, 300) });
-  const lead = byId(db.members, a.leadMemberId);
-  if (stage === 'diligence') {
-    notify(ctx, 'a:' + a.id, 'stage', '你的申请进入了尽调', '我们会通过你留下的联系方式与你联系。');
-  } else if (stage === 'initiation') {
-    notify(ctx, 'a:' + a.id, 'stage', '你被邀请参加入会仪式', `${fmtShort(a.initiationAt)}。形式，入会时揭晓。`);
-    if (lead) notify(ctx, lead.id, 'referral', `你推荐的 ${a.name} 进入了入会仪式`, `仪式定在 ${fmtShort(a.initiationAt)}。谢谢你的推荐。`);
-  } else if (stage === 'welcomed') {
-    const no = nextNo(db);
-    const hosts = db.staff.filter(x => x.host);
-    const host = hosts.sort((x, y) => db.members.filter(m => m.hostId === x.id).length - db.members.filter(m => m.hostId === y.id).length)[0];
-    const mid = 'm' + rid(6);
-    db.members.push({
-      id: mid, no, name: a.name, en: a.en || '', venture: a.venture, sector: a.sector, base: a.base, phone: a.phone,
-      hostId: host.id, since: hzDate(ctx.now), status: 'active', secret: 'sv-' + rid(16), bulletinSeenAt: '',
-    });
-    a.memberId = mid;
-    notify(ctx, 'a:' + a.id, 'stage', '欢迎入会', `你的会员编号是 No.${no}，专属服务人员是 ${host.name}。`);
-    notify(ctx, mid, 'welcome', `欢迎，No.${no}`, `我是 ${host.name}，你的专属服务人员。有任何需要，按铃即可。`);
-    if (lead) notify(ctx, lead.id, 'referral', `你推荐的 ${a.name} 正式入会`, `会员编号 No.${no}。`);
-    log(ctx, 'member', `${a.name} 正式入会，成为 No.${no}`);
-    ctx.touch('members');
-  } else if (stage === 'declined') {
-    notify(ctx, 'a:' + a.id, 'stage', '感谢你的申请', '这一次没能成行。俱乐部会在合适的时候再与你联系。');
-  }
-  if (stage !== 'welcomed') log(ctx, 'application', `${s.name} 将 ${a.name} 移至「${stageOf(stage).zh}」`);
-  ctx.touch('applications');
-  return appView(db, a, true);
+def('admin.board', 'staff', (ctx, { session_id }) => {
+  const { db, now } = ctx;
+  const s = sessionOf(db, session_id) || db.sessions.find(x => x.date === tonightDate(db.config, now));
+  const states = tableStates(db, s, null, now, { admin: true });
+  const bookings = db.bookings.filter(b => b.session_id === s.id && !['payment_expired'].includes(b.status)).map(b => bookingView(db, b, now, true));
+  return { session: sessionView(s), sessions: db.sessions.filter(x => x.status !== 'closed').map(sessionView), states, zones: zoneSummary(db, s, null, now, states), prices: db.config.prices, deposit_ratio: db.config.depositRatio, bookings, holds: db.holds.filter(h => h.session_id === s.id && !h.released_at), now: iso(now), mode: modeAt(db.config, now), hold_deadline: atHz(s.date, db.config.holdDeadline) };
 });
 
-def('admin.application.note', 'admin', (ctx, { id, text }) => {
+def('admin.bookings', 'staff', (ctx, { status, date }) => ctx.db.bookings.filter(b => (!status || b.status === status) && (!date || b.date === date))
+  .sort((a, b) => b.created_at.localeCompare(a.created_at)).slice(0, 200).map(b => bookingView(ctx.db, b, ctx.now, true)));
+
+def('admin.booking.confirm', 'staff', (ctx, { id, codes }) => {
+  const { db, now } = ctx;
+  const b = byId(db.bookings, id);
+  if (!b) fail('找不到这笔订单', 'not_found', 404);
+  if (b.status !== 'pending_confirm') fail(`订单状态已是「${BOOKING_STATUS[b.status].zh}」，不能再确认`, 'conflict', 409, 'INV-05');
+  const mine = db.occupancies.filter(o => o.booking_id === b.id && !o.released_at);
+  if (Array.isArray(codes) && codes.length) { // assign exact tables inside the zone the guest chose
+    if (b.kind !== 'booth') fail('按座位预订的订单由系统分配座位');
+    if (codes.length !== b.units) fail(`需要安排 ${b.units} 张桌`);
+    const s = sessionOf(db, b.session_id);
+    const others = liveOcc(db, now).filter(o => o.session_id === b.session_id && o.booking_id !== b.id);
+    for (const c of codes) {
+      const r = resourceOf(c);
+      if (!r || r.zone !== b.zone) fail(`${c} 不在客人选的区域里`);
+      if (s.paused.includes(c)) fail(`${c} 已暂停`);
+      if (others.some(o => o.resource === c)) fail(`${c} 已被占用`, 'conflict', 409, 'INV-01');
+    }
+    mine.forEach((o, i) => { o.resource = codes[i]; });
+    b.lines = codes.map(c => ({ code: c, seats: resourceOf(c).capacity }));
+  }
+  mine.forEach(o => { o.kind = 'confirmed'; });
+  setStatus(ctx, b, 'confirmed', { by: ctx.staff.id }); // T8
+  b.confirmed_at = iso(now);
+  if (b.price_snapshot.tickets && !db.tickets.some(k => k.booking_id === b.id)) db.tickets.push({ id: 'tk' + rid(6), booking_id: b.id, session_id: b.session_id, user_id: b.user_id, count: b.price_snapshot.tickets, drink_redeemed: false, verification: 'unverified' });
+  const z = zoneOf(b.zone);
+  notify(ctx, b.user_id, 'booking', `已交割 · ${z.zh}`, `${b.date.slice(5).replace('-', '.')} · 桌号 ${b.lines.map(l => `${l.code}「${resourceOf(l.code).card.name || l.code}」`).join('、')}。`);
+  log(ctx, 'booking.confirm', 'booking', b.id, { after: b.lines.map(l => l.code).join(',') });
+  ctx.touch('board');
+  return bookingView(db, b, now, true);
+});
+def('admin.booking.reject', 'staff', (ctx, { id, reason, suggestion, suggestion_zone }) => {
+  const { db, now } = ctx;
+  const b = byId(db.bookings, id);
+  if (!b) fail('找不到这笔订单', 'not_found', 404);
+  if (b.status !== 'pending_confirm') fail(`订单状态已是「${BOOKING_STATUS[b.status].zh}」`, 'conflict', 409, 'INV-05');
+  b.reject_reason = cleanText(reason, 120) || '这一晚安排不过来，抱歉。';
+  b.suggestion = cleanText(suggestion, 120);
+  b.suggestion_zone = zoneOf(suggestion_zone) ? suggestion_zone : '';
+  setStatus(ctx, b, 'rejected', { by: ctx.staff.id }); // T9
+  release(ctx, b, 'rejected');
+  const r = refundFor(ctx, b, 'rejected');
+  notify(ctx, b.user_id, 'booking', '本轮未进 · 门店未接受', `${b.reject_reason}${r ? ` ${yuan(r.amount)} 正在原路退回。` : ''}`);
+  log(ctx, 'booking.reject', 'booking', b.id, { reason: b.reject_reason });
+  return bookingView(db, b, now, true);
+});
+def('admin.booking.release', 'staff', (ctx, { id }) => {
+  const { db, now } = ctx;
+  const b = byId(db.bookings, id);
+  if (!b || b.status !== 'confirmed') fail('只有已确认、未到店的订单可以释放');
+  if (now < Date.parse(atHz(b.date, db.config.holdDeadline))) ruleFail('R-BK-31', `${db.config.holdDeadline} 留位截止后才能释放`);
+  if (b.table_released) return bookingView(db, b, now, true);
+  b.table_released = true; // T13
+  release(ctx, b, 'late_release');
+  b.history.push({ status: 'confirmed', at: iso(now), note: 'table_released', by: ctx.staff.id });
+  notify(ctx, b.user_id, 'booking', '桌位已释放', '已过留位时间。订金今晚仍可抵扣消费，到店后由门店重新安排。');
+  log(ctx, 'booking.release', 'booking', b.id);
+  ctx.touch('bookings');
+  return bookingView(db, b, now, true);
+});
+
+def('admin.verify', 'staff', (ctx, { code }) => {
+  const { db, now } = ctx;
+  const raw = String(code || '').trim().toUpperCase();
+  if (/^\d{6}$/.test(raw)) { // a member's rotating card code (R-MEM-05)
+    const u = db.users.find(x => x.secret && identityOf(db, x, now) === 'member_active' && [-1, 0, 1].some(k => memberCode(x.secret, now, k) === raw));
+    if (!u) fail('会员码无效或已过期，请会员刷新会员卡', 'not_found', 404);
+    const date = tonightDate(db.config, now);
+    const tonight = db.bookings.filter(b => b.user_id === u.id && b.date === date && ['confirmed', 'fulfilled'].includes(b.status)).map(b => bookingView(db, b, now, true));
+    log(ctx, 'verify.member', 'user', u.id);
+    return { kind: 'member', member: { ...userBrief(db, u, now), membership: membershipView(db, u, now), company_role: u.company_role }, bookings: tonight };
+  }
+  const b = db.bookings.find(x => x.code === raw || x.code === 'LL-' + raw);
+  if (!b) fail('找不到这张凭证', 'not_found', 404);
+  if (b.status === 'fulfilled') return { kind: 'booking', repeat: true, booking: bookingView(db, b, now, true) }; // R-VER-02
+  if (b.status !== 'confirmed') fail(`这笔订单是「${BOOKING_STATUS[b.status].zh}」，不能入场`);
+  if (b.date !== tonightDate(db.config, now)) fail(`这是 ${b.date.slice(5).replace('-', '.')} 的订单`);
+  setStatus(ctx, b, 'fulfilled', { by: ctx.staff.id }); // T12
+  b.verified_at = iso(now);
+  for (const o of db.occupancies) if (o.booking_id === b.id && !o.released_at) o.used_at = iso(now);
+  for (const k of db.tickets) if (k.booking_id === b.id) k.verification = 'verified';
+  log(ctx, 'verify.booking', 'booking', b.id);
+  ctx.touch('board');
+  return { kind: 'booking', repeat: false, booking: bookingView(db, b, now, true) };
+});
+def('admin.ticket.drink', 'staff', (ctx, { booking_id }) => {
+  const k = ctx.db.tickets.find(x => x.booking_id === booking_id);
+  if (!k) fail('这笔订单没有门票');
+  if (k.verification !== 'verified') fail('先核验入场');
+  if (k.drink_redeemed) ruleFail('R-TK-05', '赠饮已经兑换过了');
+  k.drink_redeemed = true;
+  log(ctx, 'ticket.drink', 'booking', booking_id);
+  ctx.touch('bookings');
+  return { ok: true };
+});
+def('admin.deposit.redeem', 'staff', (ctx, { booking_id, amount, note }) => {
+  const { db, now } = ctx;
+  const b = byId(db.bookings, booking_id);
+  if (!b) fail('找不到这笔订单', 'not_found', 404);
+  const p = db.payments.find(x => x.booking_id === b.id && x.kind === 'deposit' && x.status === 'paid');
+  if (!p) fail('这笔订单没有订金');
+  if (!['confirmed', 'fulfilled'].includes(b.status) || b.date !== tonightDate(db.config, now)) fail('订金只能在当晚抵扣');
+  const used = db.redemptions.filter(r => r.booking_id === b.id).reduce((s, r) => s + r.amount, 0);
+  const a = Math.round(Number(amount) * 100);
+  if (!(a > 0)) fail('请填写抵扣金额');
+  if (used + a > p.amount) ruleFail('R-VER-03', `订金只剩 ${yuan(p.amount - used)}，不能重复抵扣`);
+  db.redemptions.push({ id: 'rd' + rid(6), booking_id: b.id, amount: a, staff_id: ctx.staff.id, bill_note: clean(note, 60), at: iso(now) });
+  log(ctx, 'deposit.redeem', 'booking', b.id, { after: yuan(a) });
+  ctx.touch('ledger');
+  return bookingView(db, b, now, true);
+});
+def('admin.table.pause', 'staff', (ctx, { session_id, code, paused }) => {
+  const s = sessionOf(ctx.db, session_id);
+  if (!s || !resourceOf(code)) fail('找不到这张桌');
+  s.paused = paused ? [...new Set([...s.paused, code])] : s.paused.filter(c => c !== code);
+  const live = liveOcc(ctx.db, ctx.now).filter(o => o.session_id === s.id && o.resource === code && o.booking_id);
+  log(ctx, paused ? 'table.pause' : 'table.resume', 'resource', code, { reason: s.date });
+  ctx.touch('board');
+  return { ok: true, warning: paused && live.length ? '这张桌已有订单：订单保留原桌号，请联系客人处理。' : '' };
+});
+def('admin.hold.create', 'staff', (ctx, { session_id, code, note }) => {
+  const { db, now } = ctx;
+  const s = sessionOf(db, session_id);
+  const r = resourceOf(code);
+  if (!s || !r) fail('找不到这张桌');
+  if (liveOcc(db, now).some(o => o.session_id === s.id && o.resource === code) || s.paused.includes(code)) fail('只能为空闲的桌位线下占桌');
+  const h = { id: 'hd' + rid(6), session_id: s.id, codes: [code], note: clean(note, 60) || '电话预订', staff_id: ctx.staff.id, created_at: iso(now), released_at: null };
+  db.holds.push(h);
+  db.occupancies.push({ id: 'oc' + rid(8), resource: code, session_id: s.id, booking_id: null, hold_id: h.id, kind: 'offline_hold', seats: r.unit === 'seats' ? r.capacity : null, expires_at: null, released_at: null, release_reason: null, used_at: null });
+  log(ctx, 'hold.create', 'resource', code, { reason: h.note });
+  ctx.touch('board');
+  return h;
+});
+def('admin.hold.release', 'staff', (ctx, { id }) => {
+  const h = byId(ctx.db.holds, id);
+  if (!h || h.released_at) fail('找不到这条线下占桌');
+  h.released_at = iso(ctx.now);
+  for (const o of ctx.db.occupancies) if (o.hold_id === h.id && !o.released_at) { o.released_at = iso(ctx.now); o.release_reason = 'staff'; }
+  log(ctx, 'hold.release', 'resource', h.codes.join(','));
+  ctx.touch('board');
+  return { ok: true };
+});
+
+def('admin.members', 'staff', ctx => {
+  const { db, now } = ctx;
+  return db.users.filter(u => segsOf(db, u.id).length).map(u => ({ ...userBrief(db, u, now), city: u.city, company_role: u.company_role, membership: membershipView(db, u, now), checkins: db.checkins.filter(c => c.user_id === u.id).length, bookings: db.bookings.filter(b => b.user_id === u.id && ['confirmed', 'fulfilled'].includes(b.status)).length, unlocks: db.unlocks.filter(x => x.user_id === u.id && !x.revoked_at).map(x => x.key) }))
+    .sort((a, b) => String(a.member_no).localeCompare(String(b.member_no)));
+});
+def('admin.member', 'staff', (ctx, { id }) => {
+  const { db, now } = ctx;
+  const u = userOf(db, id);
+  if (!u) fail('找不到这位会员', 'not_found', 404);
+  return {
+    ...userBrief(db, u, now), city: u.city, company_role: u.company_role, intro: u.intro, membership: membershipView(db, u, now),
+    applications: db.applications.filter(a => a.user_id === u.id), invites: db.invites.filter(i => i.claimed_by === u.id),
+    bookings: db.bookings.filter(b => b.user_id === u.id).map(b => bookingView(db, b, now, true)).slice(0, 12),
+    checkins: db.checkins.filter(c => c.user_id === u.id).sort((a, b) => b.at.localeCompare(a.at)).slice(0, 12),
+    registrations: db.registrations.filter(r => r.user_id === u.id).map(r => ({ ...r, event: (e => e && { title: e.title, start_at: e.start_at })(byId(db.events, r.event_id)) })),
+    unlocks: db.unlocks.filter(x => x.user_id === u.id),
+  };
+});
+def('admin.applications', 'staff', ctx => ctx.db.applications.filter(a => a.status !== 'completed').sort((a, b) => b.created_at.localeCompare(a.created_at)).map(a => ({ ...a, user: userBrief(ctx.db, userOf(ctx.db, a.user_id), ctx.now) })));
+def('admin.application.review', 'staff', (ctx, { id, action, note }) => {
+  adminOnly(ctx);
   const a = byId(ctx.db.applications, id);
   if (!a) fail('找不到这份申请', 'not_found', 404);
-  text = cleanText(text, 300);
-  if (!text) fail('写点什么再保存');
-  a.notes.push({ at: iso(ctx.now), by: staffMe(ctx).name, text });
+  if (!['under_review', 'need_info'].includes(a.status)) fail('这份申请已经处理过了');
+  const to = { approve: 'approved_awaiting_payment', need_info: 'need_info', reject: 'rejected' }[action];
+  if (!to) fail('未知操作');
+  a.status = to; a.reviewer = ctx.staff.id; a.review_note = cleanText(note, 200); a.updated_at = iso(ctx.now);
+  a.history.push({ status: to, at: iso(ctx.now), by: ctx.staff.id, note: a.review_note });
+  const msg = { approved_awaiting_payment: ['审核通过', `支付首月会员费 ${yuan(ctx.db.config.memberPrice)} 后，会员立即生效。`], need_info: ['请补充资料', a.review_note || '门店需要你补充一些信息。'], rejected: ['感谢你的申请', a.review_note || '这一次没能成行。'] }[to];
+  notify(ctx, a.user_id, 'application', ...msg);
+  log(ctx, `application.${action}`, 'application', a.id, { reason: a.review_note });
   ctx.touch('applications');
-  return appView(ctx.db, a, true);
+  return { ok: true, status: to };
 });
-
-function memberStats(db, m) {
-  const visits = db.visits.filter(v => v.memberId === m.id).sort((a, b) => b.at.localeCompare(a.at));
-  return {
-    visits: visits.length, lastVisit: visits[0] ? visits[0].at : null,
-    events: db.rsvps.filter(r => r.memberId === m.id && (r.status === 'going' || r.status === 'attended')).length,
-    reservations: db.reservations.filter(r => r.memberId === m.id && r.status !== 'cancelled').length,
-    referrals: db.applications.filter(a => a.leadMemberId === m.id).length,
-  };
-}
-
-def('admin.members', 'admin', ctx => ctx.db.members.map(m => ({
-  ...brief(m), phone: m.phone, since: m.since, status: m.status, host: staffView(byId(ctx.db.staff, m.hostId)), stats: memberStats(ctx.db, m),
-})).sort((a, b) => a.no.localeCompare(b.no)));
-
-def('admin.member', 'admin', (ctx, { id }) => {
-  const { db, now } = ctx;
-  const m = byId(db.members, id);
-  if (!m) fail('找不到这位会员', 'not_found', 404);
-  const app = db.applications.find(a => a.memberId === m.id);
-  return {
-    ...brief(m), phone: m.phone, since: m.since, status: m.status, hostId: m.hostId, host: staffView(byId(db.staff, m.hostId)), stats: memberStats(db, m),
-    application: app ? appView(db, app, true) : null,
-    reservations: db.reservations.filter(r => r.memberId === m.id).map(r => resView(db, r)).sort((a, b) => b.date.localeCompare(a.date)),
-    events: db.rsvps.filter(r => r.memberId === m.id && r.status !== 'cancelled').map(r => ({ status: r.status, event: eventView(db, byId(db.events, r.eventId), null, now) })).sort((a, b) => b.event.startsAt.localeCompare(a.event.startsAt)),
-    books: db.books.filter(b => b.holderId === m.id).map(b => ({ ...bookView(db, b, m.id) })),
-    referrals: db.applications.filter(a => a.leadMemberId === m.id).map(a => appView(db, a)),
-    requests: db.requests.filter(r => r.memberId === m.id),
-    visits: db.visits.filter(v => v.memberId === m.id).sort((a, b) => b.at.localeCompare(a.at)),
-  };
+def('admin.invites', 'staff', ctx => ctx.db.invites.map(i => ({ ...i, status: i.status === 'issued' && Date.parse(i.claim_deadline) < ctx.now ? 'expired' : i.status, claimer: userBrief(ctx.db, userOf(ctx.db, i.claimed_by), ctx.now) })).sort((a, b) => b.created_at.localeCompare(a.created_at)));
+def('admin.invite.create', 'staff', (ctx, { note, phone }) => {
+  adminOnly(ctx);
+  const p = normPhone(phone);
+  if (p && !/^1\d{10}$/.test(p)) fail('手机号格式不对');
+  let tk;
+  do { tk = 'SV-' + token(6); } while (ctx.db.invites.some(i => i.token === tk));
+  const inv = { id: 'iv' + rid(6), token: tk, issued_by: ctx.staff.id, note: clean(note, 60) || '首批受邀朋友', claim_deadline: atHz(ctx.db.config.giftClaimDeadline, '23:59:59'), status: 'issued', claimed_by: null, claimed_at: null, bound_phone: p || null, held_by: null, created_at: iso(ctx.now) };
+  ctx.db.invites.push(inv);
+  log(ctx, 'invite.create', 'invite', inv.id);
+  ctx.touch('invites');
+  return inv;
 });
-
-def('admin.member.update', 'admin', (ctx, { id, hostId, status }) => {
-  const m = byId(ctx.db.members, id);
-  if (!m) fail('找不到这位会员', 'not_found', 404);
-  if (hostId) {
-    const h = byId(ctx.db.staff, hostId);
-    if (!h) fail('找不到这位服务人员');
-    if (m.hostId !== h.id) notify(ctx, m.id, 'host', `${h.name} 将成为你的专属服务人员`, '有任何需要，按铃即可。');
-    m.hostId = h.id;
-  }
-  if (status && ['active', 'paused'].includes(status)) m.status = status;
-  log(ctx, 'member', `${staffMe(ctx).name} 更新了 ${m.name} 的会员信息`);
-  ctx.touch('members');
+def('admin.invite.disable', 'staff', (ctx, { id }) => {
+  adminOnly(ctx);
+  const inv = byId(ctx.db.invites, id);
+  if (!inv || inv.status !== 'issued') fail('只能停用未领取的邀请');
+  inv.status = 'disabled';
+  log(ctx, 'invite.disable', 'invite', inv.id);
+  ctx.touch('invites');
   return { ok: true };
 });
 
-def('admin.events', 'admin', ctx => ctx.db.events.map(e => ({ ...eventView(ctx.db, e, null, ctx.now), createdAt: e.createdAt }))
-  .sort((a, b) => b.startsAt.localeCompare(a.startsAt)));
-
-def('admin.event.save', 'admin', (ctx, args) => {
-  const { db } = ctx;
-  const title = clean(args.title, 40);
-  if (!title) fail('请填写标题');
-  const date = clean(args.date, 10), from = clean(args.from, 5), to = clean(args.to, 5);
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(date) || !/^\d{2}:\d{2}$/.test(from) || !/^\d{2}:\d{2}$/.test(to)) fail('请填写日期与时间');
-  const capacity = parseInt(args.capacity, 10);
-  if (!(capacity > 0 && capacity <= 500)) fail('名额需要在 1 到 500 之间');
-  if (!EVENT_TYPES[args.type]) fail('请选择类型');
-  const data = {
-    title, en: clean(args.en, 60), type: args.type, startsAt: atHz(date, from), endsAt: atHz(to <= from ? addDays(date, 1) : date, to),
-    venue: clean(args.venue, 40) || '3F Library · 杭州', capacity, color: COLORS.includes(args.color) ? args.color : 'pink',
-    description: cleanText(args.description, 400), host: clean(args.host, 20), speakers: String(args.speakers || '').split(/[,，、\s]+/).map(s => clean(s, 20)).filter(Boolean).slice(0, 6),
-    membersOnly: args.membersOnly !== false && args.membersOnly !== 'false', status: ['draft', 'published', 'cancelled'].includes(args.status) ? args.status : 'draft',
-  };
-  let e = args.id ? byId(db.events, args.id) : null;
-  const wasPublished = e && e.status === 'published';
-  if (e) Object.assign(e, data);
-  else db.events.push(e = { id: 'e' + rid(6), ...data, createdAt: iso(ctx.now) });
-  if (data.status === 'published' && !wasPublished) log(ctx, 'event', `${staffMe(ctx).name} 发布了「${e.title}」`);
-  else log(ctx, 'event', `${staffMe(ctx).name} 编辑了「${e.title}」`);
-  if (data.status === 'cancelled') {
-    db.rsvps.filter(r => r.eventId === e.id && (r.status === 'going' || r.status === 'waitlist')).forEach(r => notify(ctx, r.memberId, 'rsvp', `活动取消 · ${e.title}`, '抱歉，这场活动取消了。'));
-  }
-  ctx.touch('events');
-  return eventView(db, e, null, ctx.now);
-});
-
-def('admin.event.delete', 'admin', (ctx, { id }) => {
-  const e = byId(ctx.db.events, id);
-  if (!e) fail('找不到这场活动', 'not_found', 404);
-  if (e.status !== 'draft') fail('只能删除草稿；已发布的活动请改为「取消」');
-  ctx.db.events = ctx.db.events.filter(x => x !== e);
-  ctx.touch('events');
-  return { ok: true };
-});
-
-def('admin.event.attendees', 'admin', (ctx, { id }) => {
-  const e = byId(ctx.db.events, id);
-  if (!e) fail('找不到这场活动', 'not_found', 404);
-  return ctx.db.rsvps.filter(r => r.eventId === id && r.status !== 'cancelled')
-    .map(r => ({ id: r.id, status: r.status, createdAt: r.createdAt, member: brief(byId(ctx.db.members, r.memberId)) }))
-    .sort((a, b) => (a.status === 'waitlist') - (b.status === 'waitlist') || a.createdAt.localeCompare(b.createdAt));
-});
-
-def('admin.reservations', 'admin', (ctx, { date }) => {
-  const { db } = ctx;
-  const lib = byId(db.floors, 'library');
-  date = /^\d{4}-\d{2}-\d{2}$/.test(date || '') ? date : bookingWindow(db, ctx.now)[0];
-  const list = db.reservations.filter(r => r.date === date && r.status !== 'cancelled')
-    .map(r => ({ ...resView(db, r), member: brief(byId(db.members, r.memberId)) }))
-    .sort((a, b) => a.session.localeCompare(b.session) || a.zoneId.localeCompare(b.zoneId));
-  const loads = Object.values(SESSIONS).map(s => ({ session: s.id, zh: s.zh, zones: lib.zones.map(z => ({ id: z.id, zh: z.zh, en: z.en, unit: z.unit, capacity: z.capacity, booked: zoneLoad(db, date, s.id, z.id) })) }));
-  const days = Array.from({ length: 14 }, (_, i) => addDays(bookingWindow(db, ctx.now)[0], i)).map(d => ({ date: d, count: db.reservations.filter(r => r.date === d && r.status !== 'cancelled').length }));
-  return { date, list, loads, days };
-});
-
-def('admin.reservation.mark', 'admin', (ctx, { id, status }) => {
-  const r = byId(ctx.db.reservations, id);
-  if (!r) fail('找不到这个预订', 'not_found', 404);
-  if (!['confirmed', 'seated', 'no-show', 'cancelled'].includes(status)) fail('未知状态');
-  r.status = status;
-  if (status === 'cancelled') notify(ctx, r.memberId, 'reservation', '你的预订已取消', `${r.code}。如有疑问，按铃找礼宾台。`);
-  ctx.touch('reservations');
-  return resView(ctx.db, r);
-});
-
-def('admin.checkin', 'admin', (ctx, { code }) => {
+def('admin.day', 'staff', (ctx, { date }) => {
   const { db, now } = ctx;
-  code = String(code ?? '').replace(/\D/g, '');
-  if (code.length !== 6) fail('入场码是 6 位数字');
-  const m = db.members.find(x => x.status === 'active' && [-1, 0, 1].some(k => entryCode(x.secret, now, k) === code));
-  if (!m) fail('入场码无效或已过期，请会员刷新钥匙页', 'not_found', 404);
-  const today = hzDate(now);
-  const lib = byId(db.floors, 'library');
-  const recent = db.visits.find(v => v.memberId === m.id && now - Date.parse(v.at) < 30 * 60e3);
-  const res = db.reservations.find(r => r.memberId === m.id && r.date === today && r.status === 'confirmed');
-  if (res) res.status = 'seated';
-  const ev = db.events.find(e => e.status === 'published' && hzDate(e.startsAt) === today && db.rsvps.some(r => r.eventId === e.id && r.memberId === m.id && r.status === 'going'));
-  if (ev) db.rsvps.filter(r => r.eventId === ev.id && r.memberId === m.id).forEach(r => { r.status = 'attended'; });
-  const place = lib.status === 'open' ? '3F Library · 杭州' : '筹备处 · 杭州';
-  if (!recent) {
-    db.visits.push({ id: 'v' + rid(8), memberId: m.id, at: iso(now), place, eventId: ev ? ev.id : null, by: staffMe(ctx).id });
-    notify(ctx, m.id, 'visit', '欢迎光临', `${place} · ${fmtTime(iso(now))} 已入场。`);
-    log(ctx, 'visit', `${m.name}（No.${m.no}）入场`);
-  }
-  ctx.touch('visits', 'reservations');
+  const d = /^\d{4}-\d{2}-\d{2}$/.test(date || '') ? date : hzDate(now);
+  const code = checkinCode(db, d);
   return {
-    member: { ...brief(m), since: m.since, host: staffView(byId(db.staff, m.hostId)), stats: memberStats(db, m) },
-    reservation: res ? resView(db, res) : null, event: ev ? eventView(db, ev, m.id, now) : null, repeat: !!recent, place,
+    date: d, mode: modeAt(db.config, now), code, pattern: stampPattern(code),
+    checkins: db.checkins.filter(c => c.date === d).sort((a, b) => b.at.localeCompare(a.at)).map(c => ({ ...c, user: userBrief(db, userOf(db, c.user_id), now) })),
+    meetings: db.meetings.filter(m => m.date >= hzDate(now)).sort((a, b) => (a.date + a.start).localeCompare(b.date + b.start)).map(m => ({ ...m, user: userBrief(db, userOf(db, m.user_id), now) })),
+    roundtables: db.events.filter(e => e.kind === 'roundtable' && hzDate(e.start_at) === d).map(e => ({ id: e.id, title: e.title, start_at: e.start_at, host: e.host, taken: db.registrations.filter(r => r.event_id === e.id && r.status !== 'cancelled').length, capacity: e.capacity })),
   };
 });
-
-def('admin.visits', 'admin', ctx => ctx.db.visits.slice().sort((a, b) => b.at.localeCompare(a.at)).slice(0, 20)
-  .map(v => ({ ...v, member: brief(byId(ctx.db.members, v.memberId)) })));
-
-def('admin.books', 'admin', ctx => ctx.db.books.map(b => ({ ...b, holder: brief(byId(ctx.db.members, b.holderId)) })));
-
-def('admin.book.mark', 'admin', (ctx, { id, action }) => {
-  const b = byId(ctx.db.books, id);
-  if (!b) fail('找不到这本书', 'not_found', 404);
-  const holder = byId(ctx.db.members, b.holderId);
-  if (action === 'lend') {
-    if (b.status !== 'held') fail('只有已预留的书可以借出');
-    b.status = 'loan';
-    b.dueAt = atHz(addDays(hzDate(ctx.now), 21), '23:59');
-    notify(ctx, holder.id, 'book', `《${b.title}》已借出`, `请在 ${b.dueAt ? fmtShort(b.dueAt).split(' ')[0] : ''} 前归还。`);
-  } else if (action === 'return') {
-    if (b.status !== 'loan') fail('这本书不在借出状态');
-    Object.assign(b, { status: 'shelf', holderId: null, heldAt: null, dueAt: null });
-    if (holder) notify(ctx, holder.id, 'book', `《${b.title}》已归还`, '谢谢，书已回到书架。');
-  } else if (action === 'release') {
-    if (b.status !== 'held') fail('这本书没有被预留');
-    Object.assign(b, { status: 'shelf', holderId: null, heldAt: null, dueAt: null });
-    if (holder) notify(ctx, holder.id, 'book', `《${b.title}》的预留已释放`, '');
+def('admin.checkin.reset', 'staff', ctx => {
+  const d = hzDate(ctx.now);
+  ctx.db.checkinOverrides[d] = token(4);
+  log(ctx, 'checkin.reset', 'checkin_code', d);
+  ctx.touch('checkins');
+  return { code: ctx.db.checkinOverrides[d] };
+});
+def('admin.meeting.respond', 'staff', (ctx, { id, action, start, end, note }) => {
+  const { db, now } = ctx;
+  const m = byId(db.meetings, id);
+  if (!m || m.status !== 'submitted') fail('这条申请已经处理过了');
+  if (action === 'accept') { m.status = 'accepted'; m.reply = cleanText(note, 120); notify(ctx, m.user_id, 'meeting', '会议申请已确认', `${m.date.slice(5).replace('-', '.')} ${m.start}–${m.end}。${m.reply}`); }
+  else if (action === 'reject') { m.status = 'rejected'; m.reply = cleanText(note, 120); notify(ctx, m.user_id, 'meeting', '会议申请未能安排', m.reply || '那天的会议区已经排满。'); }
+  else if (action === 'counter') {
+    const v = meetingCheck(db, { date: m.date, start, end }, now);
+    m.status = 'counter_proposed'; m.counter = { start: v.start, end: v.end, note: cleanText(note, 120) };
+    notify(ctx, m.user_id, 'meeting', '门店提议调整会议时间', `建议改为 ${v.start}–${v.end}。${m.counter.note}`);
   } else fail('未知操作');
-  log(ctx, 'book', `${staffMe(ctx).name}：《${b.title}》${{ lend: '借出', return: '归还', release: '释放预留' }[action]}`);
-  ctx.touch('books');
-  return { ok: true };
+  log(ctx, `meeting.${action}`, 'meeting', m.id);
+  ctx.touch('meetings');
+  return m;
 });
 
-def('admin.requests', 'admin', ctx => ctx.db.requests.map(r => ({ ...r, member: brief(byId(ctx.db.members, r.memberId)), by: staffView(byId(ctx.db.staff, r.repliedBy)) })));
-
-def('admin.request.reply', 'admin', (ctx, { id, text, close }) => {
-  const r = byId(ctx.db.requests, id);
-  if (!r) fail('找不到这条请求', 'not_found', 404);
-  const s = staffMe(ctx);
-  if (close) {
-    r.status = 'closed';
-  } else {
-    text = cleanText(text, 300);
-    if (!text) fail('写一句回复');
-    Object.assign(r, { reply: text, status: 'replied', repliedAt: iso(ctx.now), repliedBy: s.id });
-    notify(ctx, r.memberId, 'request', `${s.name} 回复了你`, text);
-    log(ctx, 'request', `${s.name} 回复了 ${(byId(ctx.db.members, r.memberId) || {}).name} 的礼宾请求`);
-  }
-  ctx.touch('requests');
+def('admin.events', 'staff', ctx => ctx.db.events.map(e => ({ ...e, taken: ctx.db.registrations.filter(r => r.event_id === e.id && r.status !== 'cancelled').length, attended: ctx.db.registrations.filter(r => r.event_id === e.id && r.status === 'attended').length })).sort((a, b) => b.start_at.localeCompare(a.start_at)));
+def('admin.event.save', 'staff', (ctx, a) => {
+  const { db, now } = ctx;
+  const title = clean(a.title, 40);
+  if (!title) fail('请填写标题');
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(a.date || '') || !/^\d{2}:\d{2}$/.test(a.from || '') || !/^\d{2}:\d{2}$/.test(a.to || '')) fail('请填写日期和时间');
+  const capacity = parseInt(a.capacity, 10);
+  if (!(capacity > 0 && capacity <= 300)) fail('名额在 1 到 300 之间');
+  if (!EVENT_KINDS[a.kind]) fail('请选择类型');
+  const data = { kind: a.kind, title, en: clean(a.en, 60), intro: cleanText(a.intro, 400), host: clean(a.host, 20), guests: clean(a.guests, 40), start_at: atHz(a.date, a.from), end_at: atHz(a.date, a.to), location: clean(a.location, 30) || '3F · library live', capacity, layer: a.layer === 0 || a.layer === '0' ? 0 : 1, public_signup: a.public_signup === true || a.public_signup === 'true', teaser: { title, hook: clean(a.hook, 40) }, status: ['published', 'draft', 'cancelled'].includes(a.status) ? a.status : 'published' };
+  let e = a.id ? byId(db.events, a.id) : null;
+  if (e) Object.assign(e, data, { tags: e.tags });
+  else db.events.push(e = { id: 'ev' + rid(6), ...data, tags: [], signup_open_at: iso(now), signup_close_at: data.start_at });
+  e.signup_close_at = data.start_at;
+  log(ctx, a.id ? 'event.update' : 'event.create', 'event', e.id);
+  ctx.touch('events');
+  return e;
+});
+def('admin.event.registrations', 'staff', (ctx, { id }) => ctx.db.registrations.filter(r => r.event_id === id && r.status !== 'cancelled').map(r => ({ ...r, user: userBrief(ctx.db, userOf(ctx.db, r.user_id), ctx.now) })));
+def('admin.registration.mark', 'staff', (ctx, { id, status, hosted }) => {
+  const r = byId(ctx.db.registrations, id);
+  if (!r) fail('找不到这条报名');
+  const u = userOf(ctx.db, r.user_id);
+  if (status) { if (!['registered', 'attended', 'cancelled'].includes(status)) fail('未知状态'); r.status = status; }
+  if (hosted != null) r.hosted = !!hosted;
+  if (r.status === 'attended') unlockBy(ctx, u, 'event_attended'); // R-EV-06
+  if (r.hosted) unlockBy(ctx, u, 'hosted_session');
+  log(ctx, 'registration.mark', 'registration', r.id, { after: `${r.status}${r.hosted ? ' · host' : ''}` });
+  ctx.touch('events');
   return r;
 });
 
-def('admin.bulletins', 'admin', ctx => ctx.db.bulletins.map(b => ({ ...b, by: staffView(byId(ctx.db.staff, b.by)) })));
-
-def('admin.bulletin.send', 'admin', (ctx, { title, body }) => {
-  title = clean(title, 40);
-  body = cleanText(body, 500);
-  if (!title || !body) fail('标题和正文都要写');
-  const s = staffMe(ctx);
-  ctx.db.bulletins.unshift({ id: 'n' + rid(6), title, body, at: iso(ctx.now), by: s.id });
-  log(ctx, 'bulletin', `${s.name} 发布了公告「${title}」`);
-  ctx.touch('bulletins');
+def('admin.content', 'staff', ctx => ctx.db.content.map(c => ({ key: c.key, kind: c.kind, layer: c.layer, mode: c.mode, teaser: c.teaser, unlock_rule: c.unlock_rule || (c.layer === 1 ? { type: 'membership' } : null), locked_placeholder: c.locked_placeholder, active: c.active !== false, unlocked: ctx.db.unlocks.filter(x => x.key === c.key && !x.revoked_at).map(x => ({ id: x.id, at: x.at, source: x.source, user: userBrief(ctx.db, userOf(ctx.db, x.user_id), ctx.now) })) })));
+def('admin.unlock.grant', 'staff', (ctx, { user_id, key }) => {
+  adminOnly(ctx);
+  const c = ctx.db.content.find(x => x.key === key);
+  const u = userOf(ctx.db, user_id);
+  if (!c || !u) fail('找不到');
+  if (!c.unlock_rule || c.unlock_rule.type !== 'staff_grant') fail('这一项不能手动授予');
+  if (!grant(ctx, u, key, 'staff_grant', ctx.staff.id)) fail('已经授予过了');
+  log(ctx, 'unlock.grant', 'content', key, { reason: u.name });
+  return { ok: true };
+});
+def('admin.unlock.revoke', 'staff', (ctx, { id }) => {
+  adminOnly(ctx);
+  const x = byId(ctx.db.unlocks, id);
+  if (!x || x.revoked_at) fail('找不到这条解锁记录');
+  x.revoked_at = iso(ctx.now);
+  log(ctx, 'unlock.revoke', 'content', x.key);
+  ctx.touch('content');
   return { ok: true };
 });
 
-def('admin.floor.update', 'admin', (ctx, { id, status, mode }) => {
-  const f = byId(ctx.db.floors, id);
-  if (!f) fail('找不到这个楼层', 'not_found', 404);
-  if (status) {
-    if (!['planned', 'preopening', 'open', 'closed'].includes(status)) fail('未知状态');
-    if (f.id !== 'library' && status !== 'planned') fail('这一层还在规划中');
-    f.status = status;
-  }
-  if (mode) {
-    if (!['auto', 'day', 'night', 'closed'].includes(mode)) fail('未知模式');
-    f.mode = mode;
-  }
-  const st = floorState(f, ctx.now);
-  log(ctx, 'floor', `${staffMe(ctx).name} 将 ${f.floor} ${f.name} 设为「${st.zh}」`);
-  ctx.touch('floors');
-  return { ...f, zones: undefined, state: st };
+def('admin.ledger', 'staff', ctx => {
+  const { db, now } = ctx;
+  const pays = db.payments.filter(p => p.status === 'paid').sort((a, b) => b.paid_at.localeCompare(a.paid_at)).map(p => ({ ...p, user: userBrief(db, userOf(db, p.user_id), now), booking_code: p.booking_id ? (byId(db.bookings, p.booking_id) || {}).code : null }));
+  const sum = kind => pays.filter(p => p.kind === kind).reduce((s, p) => s + p.amount, 0);
+  return {
+    totals: { membership: sum('membership'), deposit: sum('deposit'), ticket: sum('ticket'), refunded: db.refunds.filter(r => r.status === 'succeeded').reduce((s, r) => s + r.amount, 0), redeemed: db.redemptions.reduce((s, r) => s + r.amount, 0) },
+    payments: pays.slice(0, 80),
+    refunds: db.refunds.slice().sort((a, b) => b.created_at.localeCompare(a.created_at)).map(r => ({ ...r, user: userBrief(db, userOf(db, r.user_id), now) })),
+    redemptions: db.redemptions.slice().reverse().map(r => ({ ...r, booking_code: (byId(db.bookings, r.booking_id) || {}).code })),
+  };
+});
+def('admin.audit', 'staff', ctx => ctx.db.audit.slice(0, 120).map(a => ({ ...a, actor_name: (byId(ctx.db.staff, a.actor) || userOf(ctx.db, a.actor) || { name: a.actor }).name })));
+
+def('admin.config', 'staff', ctx => ({ config: ctx.db.config, locked: LOCKED_CONFIG, sessions: ctx.db.sessions.filter(s => s.status !== 'closed').map(sessionView) }));
+def('admin.config.set', 'staff', (ctx, { key, value }) => {
+  adminOnly(ctx);
+  const c = ctx.db.config;
+  if (LOCKED_CONFIG[key]) fail(`这一项涉及收费或退款，老板拍板前不能打开（${LOCKED_CONFIG[key]}）`, 'forbidden', 403);
+  const ints = ['lockMinutes', 'confirmMinutes', 'ticketPrice', 'memberPrice', 'windowMember', 'windowGuest'];
+  if (ints.includes(key)) { const n = parseInt(value, 10); if (!(n > 0)) fail('请填一个正整数'); c[key] = n; }
+  else if (key === 'ticketSalesEnabled') c[key] = !!value;
+  else if (/^prices\.[SAB]\.(member|guest)$/.test(key)) { const [, tier, who] = key.split('.'); const n = parseInt(value, 10); if (!(n > 0)) fail('请填一个正整数'); c.prices[tier][who] = n; }
+  else fail('这一项不能在这里修改');
+  log(ctx, 'config.set', 'config', key, { after: String(value) });
+  ctx.touch('config', 'board');
+  return { ok: true };
+});
+def('admin.session.update', 'staff', (ctx, { id, status, confirm_policy, reserved }) => {
+  const s = sessionOf(ctx.db, id);
+  if (!s) fail('找不到这一场');
+  if (status && ['on_sale', 'paused', 'cancelled'].includes(status)) s.status = status;
+  if (confirm_policy && ['tiered', 'all_manual'].includes(confirm_policy)) s.confirm_policy = confirm_policy;
+  if (Array.isArray(reserved)) s.reserved = reserved.filter(c => resourceOf(c) && resourceOf(c).type === 'booth').slice(0, 4);
+  log(ctx, 'session.update', 'session', s.id);
+  ctx.touch('board');
+  return sessionView(s);
 });
 
-def('admin.reset', 'admin', ctx => {
-  const sessions = ctx.db.sessions;
+def('admin.reset', 'staff', ctx => {
+  adminOnly(ctx);
+  const { tokens, clock } = ctx.db;
   const fresh = seed(ctx.now);
   Object.keys(ctx.db).forEach(k => delete ctx.db[k]);
-  Object.assign(ctx.db, fresh, { sessions });
+  Object.assign(ctx.db, fresh, { tokens, clock });
   ctx.touch('all');
   return { ok: true };
 });
 
+/* ---------- demo controls: a clock you can move, so 19:00 can happen on cue ---------- */
+def('demo.clock', 'public', (ctx, { action, hhmm, minutes }) => {
+  const { db } = ctx;
+  const real = ctx.now - db.clock.offsetMs;
+  if (action === 'real') db.clock.offsetMs = 0;
+  else if (action === 'plus') db.clock.offsetMs += (parseInt(minutes, 10) || 0) * MIN;
+  else if (action === 'set') {
+    if (!/^\d{2}:\d{2}$/.test(hhmm || '')) fail('时间格式 HH:MM');
+    const target = Date.parse(atHz(hzDate(ctx.now), hhmm));
+    db.clock.offsetMs = target - real;
+  } else fail('未知操作');
+  const now = real + db.clock.offsetMs;
+  ctx.touch('all');
+  return { offsetMs: db.clock.offsetMs, now: iso(now), mode: modeAt(db.config, now) };
+});
+/* what the demo members' phones show right now, so the front desk can be tried without a second phone */
+def('demo.codes', 'staff', ctx => {
+  const { db, now } = ctx;
+  const date = tonightDate(db.config, now);
+  const members = db.users.filter(u => u.secret && Object.values(PERSONAS).includes(u.phone) && identityOf(db, u, now) === 'member_active')
+    .map(u => ({ name: u.name, member_no: u.member_no, code: memberCode(u.secret, now), next_at: iso((Math.floor(now / CODE_STEP) + 1) * CODE_STEP) }));
+  const bookings = db.bookings.filter(b => b.date === date && b.status === 'confirmed').map(b => ({ code: b.code, zone: b.zone, party_size: b.party_size, name: (userOf(db, b.user_id) || {}).name }));
+  return { members, bookings };
+});
+def('demo.state', 'public', ctx => ({ offsetMs: ctx.db.clock.offsetMs, now: iso(ctx.now), mode: modeAt(ctx.db.config, ctx.now), personas: PERSONAS }));
+
 /* =========================================================
-   Dispatch: the single entry point both modes call.
+   Dispatch
    ========================================================= */
-export function handle(db, { token, method, args, now = Date.now() }) {
+export function handle(db, { token: tok, method, args, now: realNow = Date.now() }) {
   const m = METHODS[method];
   if (!m) fail('未知接口：' + method, 'not_found', 404);
-  const session = token ? db.sessions[token] : null;
-  if (m.role !== 'public') {
-    if (!session) fail('请先登录', 'auth', 401);
-    if (m.role !== 'any' && session.role !== m.role) fail('没有权限', 'forbidden', 403);
-  }
-  const changed = new Set();
-  const ctx = { db, now, token, session, touch: (...topics) => topics.forEach(t => changed.add(t)) };
+  const now = realNow + ((db.clock && db.clock.offsetMs) || 0);
+  const changed = new Set(sweep(db, now));
+  const sess = tok ? db.tokens[tok] : null;
+  const user = sess && sess.kind === 'user' ? userOf(db, sess.id) : null;
+  const staff = sess && sess.kind === 'staff' ? byId(db.staff, sess.id) : null;
+  if (m.role === 'user' && !user) fail('请先登录', 'auth', 401);
+  if ((m.role === 'staff' || m.role === 'admin') && !staff) fail('请先登录后台', 'auth', 401);
+  if (m.role === 'any' && !sess) fail('请先登录', 'auth', 401);
+  const ctx = { db, now, token: tok, session: sess, user, staff, touch: (...t) => t.forEach(x => changed.add(x)) };
   const result = m.fn(ctx, args && typeof args === 'object' ? args : {});
   return { result: result === undefined ? null : result, changed: [...changed] };
 }
 export const methodNames = () => Object.keys(METHODS);
-
-/* ---------- formatting used inside notices ---------- */
-const WEEK = ['周日', '周一', '周二', '周三', '周四', '周五', '周六'];
-export function fmtShort(t) {
-  const x = hz(t);
-  return `${x.m}.${String(x.d).padStart(2, '0')} ${WEEK[x.dow]} ${String(x.h).padStart(2, '0')}:${String(x.mi).padStart(2, '0')}`;
-}
-export function fmtTime(t) {
-  const x = hz(t);
-  return `${String(x.h).padStart(2, '0')}:${String(x.mi).padStart(2, '0')}`;
-}

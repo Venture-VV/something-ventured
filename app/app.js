@@ -1,936 +1,721 @@
 /* =========================================================
-   Something Ventured · member app
-   Hash routes, one state object, views as html`` templates.
-   Works against the bundled server or fully in the browser
-   (see shared/api.js), and keeps the key usable offline.
+   library live · sth.ventured — member web app (v2)
+   Four entries (首页 · 预订 · 活动 · 我的), two skins:
+   the public sees a library (L0), members see the machine (L1+).
+   Identity, layers, prices and inventory are all decided by the core
+   (shared/core.js); this file only draws what it is told (R-LAY-01).
    ========================================================= */
 import { connect, call, auth, onChange, getMode, store } from '../shared/api.js';
-import { html, raw, fmt, toast, debounce, initialOf, reduceMotion } from '../shared/ui.js';
-import { SECTORS, BASES, PATH, EVENT_TYPES, SESSIONS, REQUEST_TYPES, CITIES, entryCode, CODE_STEP, hz, sectorOf, DEMO_CODE } from '../shared/core.js';
+import { html, raw, fmt, toast, debounce, reduceMotion } from '../shared/ui.js';
+import { ZONES, DAY_ZONES, zoneOf, resourceOf, planASCII, planSVG } from '../shared/plan.js';
+import { memberCode, CODE_STEP, BOOKING_STATUS, APP_STATUS, EVENT_KINDS, IDENTITIES, BOOKS, yuan, stampPattern, PERSONAS, DEMO_CODE } from '../shared/core.js';
+import { FIG, scramble, typewrite, bar, stampText, decrypt, punchCard, donut } from './ascii.js';
 
 const $ = (s, el = document) => el.querySelector(s);
+const $$ = (s, el = document) => [...el.querySelectorAll(s)];
 const screenEl = $('#screen');
 const tabbarEl = $('#tabbar');
 const sheetEl = $('#sheet');
-const icon = (id, cls = '') => raw(`<svg class="${cls}" aria-hidden="true"><use href="#i-${id}"/></svg>`);
+const overlayEl = $('#overlay');
+const icon = id => raw(`<svg aria-hidden="true"><use href="#i-${id}"/></svg>`);
+const pad = n => String(n).padStart(2, '0');
 
 const S = {
-  role: null,
-  route: null,
-  params: {},
-  data: {},
-  sheet: null,
-  seq: 0,
-  ui: { filter: 'all', date: null, session: 'day', zone: null, party: 1, note: '', floor: 'library', q: '', invite: null, inviteInfo: null, reqType: 'table', lastVisits: null, firstKey: false },
+  me: null, route: null, params: {}, seq: 0, data: {}, sheet: null, skew: 0,
+  ui: { session: null, zone: null, layout: 'night', party: 2, extra: 0, note: '', explanation: '', evFilter: 'all', cracked: [], prev: {}, quote: null, quoteErr: null, figTaps: [] },
 };
-
-/* ---------- data with an offline cache ---------- */
-const CACHE_KEY = 'sv.app.cache';
-let cache = store.json(CACHE_KEY, {});
-const persistCache = debounce(() => store.set(CACHE_KEY, JSON.stringify(cache)), 600);
-async function get(method, args = {}) {
-  const key = method + JSON.stringify(args);
-  try {
-    const v = await call(method, args);
-    if (S.role === 'member') { cache[key] = v; persistCache(); }
-    return v;
-  } catch (e) {
-    if (e.code === 'offline' && key in cache) { S.offline = true; return cache[key]; }
-    throw e;
-  }
-}
+const serverNow = () => Date.now() + S.skew;
+const tonightHZ = () => { const t = new Date(serverNow() + 8 * 36e5); if (t.getUTCHours() < 2) t.setUTCDate(t.getUTCDate() - 1); return t.toISOString().slice(0, 10); };
+const home = () => { if (location.hash === '#/home') route(); else go('home'); };
+const term = () => !!S.me && S.me.layer >= 1;
+const mode = () => (S.me ? S.me.mode : 'night');
 
 /* ---------- routes ---------- */
 const ROUTES = {
-  welcome: { auth: 'none', view: viewWelcome },
-  login: { auth: 'none', view: viewLogin },
-  apply: { auth: 'none', view: viewApply },
-  status: { auth: 'applicant', load: () => call('application.status'), view: viewStatus },
-  lobby: { auth: 'member', tab: 'lobby', load: () => get('lobby'), view: viewLobby },
-  programme: { auth: 'member', tab: 'programme', load: () => get('events.list'), view: viewProgramme },
-  key: { auth: 'member', tab: 'key', load: () => get('me'), view: viewKey, after: afterKey },
-  reserve: { auth: 'member', tab: 'reserve', load: loadReserve, view: viewReserve },
-  me: { auth: 'member', tab: 'me', load: loadMe, view: viewMe },
-  stacks: { auth: 'member', tab: 'me', load: () => get('books.list'), view: viewStacks },
+  home: { tab: 'home', load: () => call('home'), view: viewHome },
+  book: { tab: 'book', load: loadBook, view: viewBook, after: afterBook },
+  events: { tab: 'events', load: () => call('events.list'), view: viewEvents },
+  me: { tab: 'me', load: loadMe, view: viewMe, after: afterMe },
+  order: { tab: 'me', load: () => call('booking.get', { id: S.params.id }), view: viewOrder },
+  content: { tab: 'home', load: () => call('content.get', { key: S.params.id }), view: viewContent, after: afterContent },
+  invite: { tab: 'me', load: () => call('invite.view', { token: S.params.id }), view: viewInvite },
+  login: { tab: null, view: viewLogin },
+  apply: { tab: 'me', view: viewApply },
 };
-const TABS = [
-  ['lobby', 'lobby', '大堂'],
-  ['programme', 'ticket', '节目'],
-  ['key', 'key', '钥匙'],
-  ['reserve', 'lamp', '预订'],
-  ['me', 'cameo', '我的'],
-];
+const TABS = [['home', 'home', '首页', 'F1'], ['book', 'map', '预订', 'F2'], ['events', 'ticket', '活动', 'F3'], ['me', 'me', '我的', 'F4']];
+function go(path) { location.hash = '#/' + path; }
 
-function go(name, params = '') { location.hash = '#/' + name + (params ? '?' + params : ''); }
+async function refreshMe() {
+  const me = await call('me');
+  S.skew = Date.parse(me.now) - Date.now();
+  const before = S.me;
+  S.me = me;
+  applySkin();
+  if (me.play_unlock && (!before || before.identity !== 'member_active' || !overlayEl.dataset.played)) playUnlock();
+  return me;
+}
 
 async function route() {
-  const [rawName, query] = location.hash.replace(/^#\/?/, '').split('?');
-  S.params = Object.fromEntries(new URLSearchParams(query || ''));
-  let name = ROUTES[rawName] ? rawName : null;
-  if (!S.role) { if (!name || ROUTES[name].auth !== 'none') name = 'welcome'; }
-  else if (S.role === 'applicant') { if (name !== 'status' && name !== 'apply') name = 'status'; }
-  else if (!name || ROUTES[name].auth !== 'member') name = 'lobby';
-  if (name !== rawName) history.replaceState(null, '', '#/' + name + (query && name === rawName ? '?' + query : ''));
-  const entering = S.route !== name;
-  if (entering) { stopKey(); if (S.sheet) closeSheet(); }
-  S.route = name;
-  if (name === 'apply' && S.params.invite && S.ui.invite !== S.params.invite) {
-    S.ui.invite = S.params.invite;
-    checkInvite(S.params.invite, true);
-  }
-  const r = ROUTES[name];
+  const [path, query] = location.hash.replace(/^#\/?/, '').split('?');
+  const [name, id] = (path || 'home').split('/');
+  S.params = { id: id ? decodeURIComponent(id) : null, ...Object.fromEntries(new URLSearchParams(query || '')) };
+  const r = ROUTES[name] ? name : 'home';
+  if (r !== name) history.replaceState(null, '', '#/home');
+  if ((r === 'apply') && !S.me.user) { go('login?next=apply'); return; }
+  const entering = S.route !== r || r === 'order' || r === 'content';
+  if (entering && S.sheet) closeSheet();
+  S.route = r;
   const seq = ++S.seq;
-  if (r.load) {
-    if (!S.data[name]) render({ loading: true });
+  const def = ROUTES[r];
+  if (def.load) {
+    const slow = setTimeout(() => { if (seq === S.seq) renderShell(true); }, 180);
     try {
-      const data = await r.load();
+      const [, data] = await Promise.all([refreshMe(), def.load()]);
+      clearTimeout(slow);
       if (seq !== S.seq) return;
-      S.data[name] = data;
-    } catch (e) {
-      if (seq !== S.seq) return;
-      if (handleError(e)) return;
-    }
-  }
-  render({ enter: entering });
+      S.data[r] = data;
+    } catch (e) { clearTimeout(slow); if (seq === S.seq) handleError(e); return; }
+  } else await refreshMe();
+  render(entering);
 }
 
-function render({ enter = false, loading = false } = {}) {
-  const r = ROUTES[S.route];
+function render(enter = false) {
+  const def = ROUTES[S.route];
   const prev = $('.main', screenEl);
   const keep = !enter && prev ? prev.scrollTop : 0;
-  screenEl.classList.toggle('velvet', S.route === 'key');
-  if (loading) {
-    screenEl.innerHTML = html`${bar({ title: '' })}<div class="boot" style="background:transparent"><svg class="boot__crest" style="color:var(--accent-fg)"><use href="#i-crest"/></svg></div>`.s;
-  } else {
-    screenEl.innerHTML = r.view(S.data[S.route]).s;
-  }
+  screenEl.innerHTML = def.view(S.data[S.route]).s;
   const main = $('.main', screenEl);
-  if (main) {
-    main.scrollTop = keep;
-    if (enter && !loading) main.classList.add('enter');
+  if (main) { main.scrollTop = keep; if (enter) main.classList.add('enter'); }
+  renderTabs();
+  if (term() && enter) $$('[data-scramble]', screenEl).forEach(el => scramble(el));
+  if (def.after) def.after();
+}
+function renderShell(loading) {
+  if (!loading) return;
+  screenEl.innerHTML = term() ? html`<div class="boot"><span class="boot__cursor">loading_</span></div>`.s : html`<div class="boot" style="background:var(--bg);color:var(--fg)"><span class="boot__cursor" style="font-family:var(--serif);font-style:italic;font-size:22px">library live</span></div>`.s;
+}
+function renderTabs() {
+  const tab = ROUTES[S.route].tab;
+  tabbarEl.hidden = !tab;
+  if (!tab) return;
+  tabbarEl.innerHTML = TABS.map(([id, ic, zh, fk]) => html`<a class="tab ${tab === id ? 'is-on' : ''}" href="#/${id}" ${raw(tab === id ? 'aria-current="page"' : '')}>${icon(ic)}${term() ? html`<small>${fk}</small>` : ''}<span>${zh}</span></a>`.s).join('');
+}
+function applySkin() {
+  const root = document.documentElement;
+  root.dataset.skin = term() ? 'terminal' : 'library';
+  root.dataset.mode = mode();
+  const ph = store.get('sv.phosphor');
+  const paper = store.get('sv.paper');
+  if (ph) root.dataset.phosphor = ph; else delete root.dataset.phosphor;
+  if (paper) root.dataset.paper = paper; else delete root.dataset.paper;
+  const color = term() ? (mode() === 'day' ? '#F1EEE2' : '#0A0806') : mode() === 'day' ? '#EDE5D3' : '#0F1F19';
+  $('meta[name="theme-color"]').setAttribute('content', color);
+}
+
+/* ---------- headers ---------- */
+const modeLabel = m => ({ day: '白天 · 会员时间', night: '夜晚 · 演出', closed: '打烊中' })[m];
+function header(title, sub, { back = null } = {}) {
+  const unread = S.me && S.me.unread;
+  const bell = S.me && S.me.user ? html`<button class="ibtn" data-act="notices" aria-label="通知${unread ? '，有未读' : ''}">${icon('bell')}${unread ? html`<span class="ibtn__dot"></span>` : ''}</button>` : '';
+  if (term()) {
+    const t = fmt.time(new Date(serverNow()));
+    return html`<header class="tline">${back ? html`<a class="ibtn" href="#/${back}" aria-label="返回">${icon('back')}</a>` : ''}
+      <span><span class="led"></span><b>${mode().toUpperCase()}</b> ${t}</span><span class="tline__sp"></span>
+      <span data-scramble>${title}</span><span class="tline__sp"></span><span>#${S.me.user.member_no || '----'}</span>${bell}</header>`;
   }
-  renderTabbar();
-  themeColor();
-  if (!loading && r.after) r.after();
+  return html`<header class="bar"><div>${back ? html`<a class="ibtn" href="#/${back}" aria-label="返回">${icon('back')}</a>` : ''}</div>
+    <div class="bar__mid"><span class="bar__t">${title}</span>${sub ? html`<span class="bar__s">${sub}</span>` : ''}</div><div>${bell}</div></header>`;
+}
+function masthead() {
+  const p = fmt.parts(new Date(serverNow()));
+  const unread = S.me && S.me.unread;
+  return html`<header class="mast"><p class="mast__k">sth.ventured · 杭州武林路 9 号</p><h1 class="mast__t">library live</h1>
+    <p class="mast__d">${p.y}.${pad(p.m)}.${pad(p.d)} ${p.dowZh} · ${modeLabel(mode())}</p>
+    ${S.me && S.me.user ? html`<button class="ibtn" data-act="notices" aria-label="通知">${icon('bell')}${unread ? html`<span class="ibtn__dot"></span>` : ''}</button>` : html`<a class="ibtn" href="#/login" aria-label="登录">${icon('me')}</a>`}</header>`;
 }
 
-function renderTabbar() {
-  const r = ROUTES[S.route];
-  const show = S.role === 'member' && r && r.tab;
-  tabbarEl.hidden = !show;
-  if (!show) return;
-  tabbarEl.innerHTML = TABS.map(([id, ic, label]) => id === 'key'
-    ? html`<a class="tab tab--key ${r.tab === id ? 'is-on' : ''}" href="#/key" aria-label="钥匙 · 出示入场" ${raw(r.tab === id ? 'aria-current="page"' : '')}><span class="keybtn">${icon('key')}</span><span>${label}</span></a>`.s
-    : html`<a class="tab ${r.tab === id ? 'is-on' : ''}" href="#/${id}" ${raw(r.tab === id ? 'aria-current="page"' : '')}>${icon(ic)}<span>${label}</span></a>`.s).join('');
-}
-
-/* ---------- shared bits ---------- */
-function bar({ title = '', sub = '', back = null, right = null, word = false, clear = false } = {}) {
-  return html`<header class="bar ${clear ? 'bar--clear' : ''}">
-    <div>${back ? html`<a class="iconbtn" href="#/${back}" aria-label="返回">${icon('back')}</a>` : ''}</div>
-    <div class="bar__mid">${word ? html`<span class="bar__word">Something Ventured</span>` : html`<span class="bar__title">${title}</span>${sub ? html`<span class="bar__sub">${sub}</span>` : ''}`}</div>
-    <div>${right || ''}</div>
-  </header>`;
-}
-const isStandalone = () => matchMedia('(display-mode: standalone)').matches || navigator.standalone === true;
-const greeting = () => {
-  const h = hz().h;
-  return h >= 5 && h < 11 ? ['Good morning', '早上好'] : h >= 11 && h < 18 ? ['Good afternoon', '下午好'] : ['Good evening', '晚上好'];
-};
-const typeOf = t => EVENT_TYPES[t] || { en: 'Evening', zh: '活动' };
-const maskPhone = p => String(p || '').replace(/^(\d{3})\d{4}(\d{4})$/, '$1 **** $2');
-
-function ticket(e, { compact = false } = {}) {
-  const p = fmt.parts(e.startsAt);
-  const t = typeOf(e.type);
-  const seats = e.past ? (e.mine === 'attended' ? '你到场了' : '已结束')
-    : e.left > 0 ? `余 ${e.left} / ${e.capacity} 席` : `已满 · 候补 ${e.waitlist}`;
-  const stamp = e.mine === 'going' ? html`<span class="tstamp">Admitted<small>已报名</small></span>`
-    : e.mine === 'waitlist' ? html`<span class="tstamp tstamp--wait">Waitlist<small>候补中</small></span>`
-    : e.mine === 'attended' ? html`<span class="tstamp">Attended<small>已到场</small></span>` : '';
-  return html`<button class="ticket c-${e.color} ${e.past ? 'is-past' : ''} ${stamp ? 'has-stamp' : ''}" data-act="event" data-id="${e.id}">
-    <span class="ticket__stub"><span>${p.mon}</span><b>${p.d}</b><small>${p.dowZh}</small></span>
-    <span class="ticket__main">
-      <span class="ticket__k">${t.en} · ${t.zh}</span>
-      <span class="ticket__t">${e.title}</span>
-      ${compact ? '' : html`<span class="ticket__en">${e.en}</span>`}
-      <span class="ticket__m"><span>${icon('clock')}${fmt.time(e.startsAt)} – ${fmt.time(e.endsAt)}</span><span>${icon('pin')}${e.venue}</span></span>
-      <span class="ticket__seats">${seats}</span>
-      ${stamp}
-    </span>
-  </button>`;
-}
-
-function keytag(r) {
-  return html`<div class="keytag">
-    <span class="keytag__fob"><b>${r.floor.floor}</b></span>
-    <span class="keytag__main">
-      <span class="keytag__k">${r.floor.name} · 座位预订</span>
-      <span class="keytag__t">${r.zone.zh} · ${r.sessionInfo.zh}</span>
-      <span class="keytag__m">${fmt.mdOf(r.date)} ${fmt.dowOf(r.date)} · ${r.sessionInfo.hours} · ${r.party} 位 · ${r.code}</span>
-    </span>
-  </div>`;
-}
-
-function memberCard(me, { stamp = null, flipped = false } = {}) {
-  const sector = sectorOf(me.sector);
-  return html`<div class="mcard ${flipped ? 'is-flipped' : ''}" data-act="flip" role="button" tabindex="0" aria-label="会员卡，点按翻面">
-    <div class="mcard__flip">
-      <div class="mcard__face mcard__front">
-        <div class="mcard__guil"></div><div class="mcard__border"></div>
-        <svg class="mcard__crest"><use href="#i-crest"/></svg>
-        <p class="mcard__brand">Something Ventured</p>
-        <p class="mcard__role">Member · 会员</p>
-        ${me.en ? html`<p class="mcard__name">${me.en}</p>` : html`<p class="mcard__name mcard__name--zh">${me.name}</p>`}
-        <p class="mcard__meta">${sector.en} · ${me.base}</p>
-        <div class="mcard__foot"><span>No. ${me.no || '————'}</span><span>HZ · SH · SZ · BJ</span></div>
-        <span class="mcard__foil"></span><span class="mcard__glare"></span>
-        ${stamp ? html`<span class="mcard__stamp">${stamp[0]}<small>${stamp[1]}</small></span>` : ''}
-      </div>
-      <div class="mcard__face mcard__back">
-        <div class="mcard__stripe"></div>
-        <p class="mcard__bk">Valid at every house of</p>
-        <p class="mcard__bb">Something Ventured</p>
-        <ul class="mcard__cities">${CITIES.map((c, i) => html`<li class="${i === 0 ? 'is-on' : ''}">${c.en}</li>`)}</ul>
-        <div class="mcard__sig"><span>${me.host ? 'Host · 专属服务' : 'Lead · 推荐人'}</span><b>${me.host ? me.host.en : (me.lead || '—')}</b></div>
-      </div>
-    </div>
-  </div>`;
-}
-
-/* The house in Hangzhou: a symmetric facade, three floors, a sign full of bulbs. */
-function houseSVG(floors = []) {
-  const status = id => (floors.find(f => f.id === id) || {}).status || (id === 'library' ? 'preopening' : 'planned');
-  const libOn = status('library') !== 'planned' && status('library') !== 'closed';
-  const bulbs = [];
-  for (let x = 84; x <= 236; x += 8) bulbs.push(`<circle class="bulb" cx="${x}" cy="14" r="1.5"/><circle class="bulb" cx="${x}" cy="36" r="1.5"/>`);
-  for (let y = 20; y <= 30; y += 5) bulbs.push(`<circle class="bulb" cx="82" cy="${y}" r="1.5"/><circle class="bulb" cx="238" cy="${y}" r="1.5"/>`);
-  const arch = cx => `M${cx - 14} 128V97a14 14 0 0 1 28 0v31z`;
-  const third = [112, 160, 208].map((cx, i) => `
-    <path d="${arch(cx)}" class="${libOn ? 'h-win win-on' : 'h-winoff'}"/>
-    ${libOn ? `<rect x="${cx - 12}" y="113" width="24" height="2" class="h-shelf"/><rect x="${cx - 12}" y="121" width="24" height="2" class="h-shelf"/>
-      ${[0, 1, 2, 3, 4, 5].map(k => `<rect x="${cx - 11 + k * 4}" y="${105 + (k % 3)}" width="2.4" height="${8 - (k % 3)}" class="h-book"/><rect x="${cx - 10 + k * 4}" y="${115 + ((k + 1) % 3)}" width="2.4" height="${6 - ((k + 1) % 3)}" class="h-book"/>`).join('')}
-      ${i === 1 ? `<path d="M153 104h14l-3-5h-8z" class="h-lamp"/><rect x="159.3" y="104" width="1.4" height="9" class="h-brass"/><ellipse cx="160" cy="106" rx="9" ry="3" class="h-glow"/>` : ''}` : ''}
-    <path d="${arch(cx)}" class="h-frame"/><path d="M${cx} 85v43M${cx - 14} 110h28" class="h-mullion"/>`).join('');
-  const second = [112, 160, 208].map(cx => `
-    <rect x="${cx - 14}" y="148" width="28" height="42" class="h-winoff"/>
-    <path d="M${cx - 14} 148h13c-5 14-5 28 0 42h-13z" class="h-curtain"/><path d="M${cx + 14} 148h-13c5 14 5 28 0 42h13z" class="h-curtain"/>
-    <rect x="${cx - 16}" y="145" width="32" height="5" class="h-rasp"/><rect x="${cx - 14}" y="148" width="28" height="42" class="h-frame"/>`).join('');
-  const awning = (x, w, y) => `<rect x="${x}" y="${y}" width="${w}" height="8" fill="url(#awn)"/>${Array.from({ length: Math.round(w / 8) }, (_, k) => `<circle cx="${x + 4 + k * 8}" cy="${y + 8}" r="4" class="${k % 2 ? 'h-cream' : 'h-rasp'}"/>`).join('')}`;
-  return raw(`<svg viewBox="0 0 320 290" role="img" aria-label="杭州的那栋楼：3F Library，2F Nightclub，1F Dining &amp; Bar">
-    <defs><pattern id="awn" width="8" height="8" patternUnits="userSpaceOnUse"><rect width="4" height="8" class="h-rasp"/><rect x="4" width="4" height="8" class="h-cream"/></pattern></defs>
-    <rect x="0" y="268" width="320" height="22" class="h-ground"/>
-    <rect x="97" y="38" width="3" height="22" class="h-ink"/><rect x="220" y="38" width="3" height="22" class="h-ink"/>
-    <rect x="78" y="9" width="164" height="32" rx="2" class="h-rasp"/>
-    <g class="h-bulb">${bulbs.join('')}</g>
-    <text x="160" y="29" text-anchor="middle" class="h-sign">SOMETHING VENTURED</text>
-    <rect x="66" y="57" width="188" height="12" class="h-facade2"/><rect x="60" y="67" width="200" height="5" class="h-rasp"/>
-    <rect x="68" y="72" width="184" height="196" class="h-facade"/>
-    <rect x="68" y="72" width="9" height="196" class="h-facade2"/><rect x="243" y="72" width="9" height="196" class="h-facade2"/>
-    <rect x="64" y="134" width="192" height="5" class="h-facade2"/><rect x="64" y="138.5" width="192" height="1.5" class="h-rasp"/>
-    <rect x="64" y="199" width="192" height="5" class="h-facade2"/><rect x="64" y="203.5" width="192" height="1.5" class="h-rasp"/>
-    ${third}${second}
-    ${awning(84, 48, 212)}${awning(188, 48, 212)}
-    <rect x="90" y="226" width="36" height="28" class="h-winoff"/><rect x="194" y="226" width="36" height="28" class="h-winoff"/>
-    <path d="M90 240h36M108 226v28M194 240h36M212 226v28" class="h-mullion"/>
-    <rect x="90" y="226" width="36" height="28" class="h-frame"/><rect x="194" y="226" width="36" height="28" class="h-frame"/>
-    ${awning(140, 40, 214)}
-    <path d="M146 268v-32a14 14 0 0 1 28 0v32z" class="h-door"/><path d="M160 222v46" class="h-mullion"/>
-    <circle cx="156.5" cy="250" r="1.6" class="h-brass"/><circle cx="163.5" cy="250" r="1.6" class="h-brass"/>
-    <circle cx="137" cy="238" r="6" class="h-glow"/><rect x="134.5" y="234" width="5" height="8" rx="1" class="h-brass"/>
-    <circle cx="183" cy="238" r="6" class="h-glow"/><rect x="180.5" y="234" width="5" height="8" rx="1" class="h-brass"/>
-    <rect x="122" y="258" width="10" height="10" class="h-rasp"/><circle cx="127" cy="251" r="8" class="h-green"/>
-    <rect x="188" y="258" width="10" height="10" class="h-rasp"/><circle cx="193" cy="251" r="8" class="h-green"/>
-    <rect x="140" y="268" width="40" height="4" class="h-facade2"/>
-    <text x="56" y="112" text-anchor="end" class="h-label">3F</text><text x="56" y="174" text-anchor="end" class="h-label">2F</text><text x="56" y="244" text-anchor="end" class="h-label">1F</text>
-    <text x="264" y="112" class="h-label h-label--sm">LIBRARY</text><text x="264" y="174" class="h-label h-label--sm">NIGHT</text><text x="264" y="244" class="h-label h-label--sm">DINING</text>
-  </svg>`);
-}
-
-/* The 3F Library seen from above: fireside, long table, listening corner, two studies, a small stage. */
-function planSVG(zones, selected) {
-  const z = id => zones.find(x => x.id === id) || { left: 0, capacity: 0 };
-  const full = id => z(id).left <= 0;
-  const tag = (id, x, y) => {
-    const info = z(id);
-    const label = `${info.zh} · ${full(id) ? '已满' : '余 ' + info.left}`;
-    const w = 14 + [...label].reduce((s, c) => s + (c.charCodeAt(0) > 255 ? 9 : 5.4), 0);
-    return `<g class="z-tag"><rect x="${x - w / 2}" y="${y - 8}" width="${w}" height="15" rx="7.5"/><text x="${x}" y="${y + 2.8}" text-anchor="middle">${label}</text></g>`;
-  };
-  const zone = (id, hit, body, tx, ty) => `<g class="zone ${selected === id ? 'is-on' : ''} ${full(id) ? 'is-full' : ''}" data-act="zone" data-zone="${id}" role="button" tabindex="0" aria-pressed="${String(selected === id)}" aria-label="${z(id).zh}，${full(id) ? '已满' : '剩余 ' + z(id).left}">
-    <rect class="z-hit" ${hit} rx="6"/>${body}${tag(id, tx, ty)}</g>`;
-  const SP = ['#9B2D4A', '#DDA640', '#8FB3C9', '#3A2A26', '#8CC1A6', '#E7A9A6', '#B59FCC', '#EADBC2'];
-  let top = '';
-  for (let x = 14, i = 0; x < 306; x += 6, i++) {
-    if (x > 128 && x < 190) continue;
-    top += `<rect x="${x}" y="12" width="5" height="${14 + ((i * 7) % 6)}" fill="${SP[i % SP.length]}"/>`;
+/* ---------- shared pieces ---------- */
+const zoneAvail = z => (z.kind === 'booth' ? (z.free ? `余 ${z.free} 张` : z.sealed ? '会员预留 · 19:00 开放' : '已满') : z.free ? `余 ${z.free} 座` : '已满');
+const minFrom = (zones, who) => Math.min(...zones.filter(z => z.kind === 'booth').map(z => z.price[who === 'member' ? 'min_member' : 'min_guest']));
+function statusBanner() {
+  const me = S.me;
+  if (!me.user) return html`<div class="banner"><b>登录后可以订座、购票、报名</b><p>用手机号登录；会员仅限邀请或申请审核。</p><a class="btn btn--sm" href="#/login">登录</a></div>`;
+  if (me.identity === 'invitee') return html`<div class="banner"><b>你有一张未领取的邀请</b><p>${me.invite.note}</p><a class="btn btn--sm" href="#/invite/${me.invite.token}">打开邀请函</a></div>`;
+  if (me.identity === 'applicant') {
+    const a = me.application;
+    if (a.status === 'approved_awaiting_payment') return html`<div class="banner"><b>审核通过 · 付款后会员生效</b><p>首月会员费 ${yuan(me.member_price)}，付款前请阅读规则。</p><a class="btn btn--sm" href="#/me">去付款</a></div>`;
+    return html`<div class="banner"><b>入会申请 · ${a.label.zh}</b><p>${a.status === 'need_info' ? a.review_note || '门店需要你补充资料。' : '审核期间，按非会员规则订座。'}</p><a class="btn btn--sm" href="#/me">查看进度</a></div>`;
   }
-  let sides = '';
-  for (let y = 44, i = 0; y < 126; y += 6, i++) {
-    sides += `<rect x="12" y="${y}" width="${13 + ((i * 5) % 6)}" height="5" fill="${SP[(i + 3) % SP.length]}"/><rect x="${308 - (13 + ((i * 3) % 6))}" y="${y}" width="${13 + ((i * 3) % 6)}" height="5" fill="${SP[(i + 5) % SP.length]}"/>`;
-  }
-  const chairs = [];
-  for (let i = 0; i < 8; i++) chairs.push(`<rect x="122" y="${151 + i * 18.4}" width="11" height="11" rx="3" class="p-chair"/><rect x="187" y="${151 + i * 18.4}" width="11" height="11" rx="3" class="p-chair"/>`);
-  const lamps = [0, 1, 2, 3].map(i => `<circle cx="160" cy="${166 + i * 38}" r="7" class="p-glow"/><circle cx="160" cy="${166 + i * 38}" r="4" class="p-lamp"/>`).join('');
-  const study = y => `<rect x="238" y="${y}" width="66" height="76" class="p-room"/><path d="M238 ${y + 50}v20" class="p-gap"/><path d="M238 ${y + 50}a20 20 0 0 1 20 20" class="p-swing"/>
-    <rect x="262" y="${y + 22}" width="26" height="30" rx="2" class="p-wood"/>
-    <rect x="252" y="${y + 26}" width="8" height="8" rx="2" class="p-chair"/><rect x="252" y="${y + 40}" width="8" height="8" rx="2" class="p-chair"/>
-    <rect x="290" y="${y + 26}" width="8" height="8" rx="2" class="p-chair"/><rect x="290" y="${y + 40}" width="8" height="8" rx="2" class="p-chair"/>`;
-  return raw(`<svg viewBox="0 0 320 420" role="group" aria-label="3F Library 平面图，点选区域">
-    <defs>
-      <pattern id="hatch" width="6" height="6" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><rect width="6" height="6" fill="rgba(138,122,112,.10)"/><rect width="1.6" height="6" fill="rgba(138,122,112,.45)"/></pattern>
-      <pattern id="parq" width="16" height="16" patternUnits="userSpaceOnUse"><rect width="16" height="16" class="p-floor"/><path d="M0 8h8V0M8 16V8h8" class="p-parq"/></pattern>
-    </defs>
-    <rect x="8" y="8" width="304" height="404" fill="url(#parq)"/>
-    ${top}${sides}
-    <rect x="132" y="10" width="56" height="26" class="p-brick"/><path d="M144 36v-12a16 12 0 0 1 32 0v12z" class="p-hearth"/><path d="M160 34c-6-4-4-9 0-13 1 4 5 5 4 9 2-1 2-3 2-4 2 3 1 7-6 8z" class="p-flame"/>
-    ${zone('fireside', 'x="58" y="40" width="204" height="86"', `
-      <ellipse cx="160" cy="82" rx="64" ry="30" class="p-rug"/>
-      <rect x="84" y="56" width="22" height="52" rx="6" class="p-sofa"/><rect x="214" y="56" width="22" height="52" rx="6" class="p-sofa"/>
-      <rect x="80" y="56" width="8" height="52" rx="4" class="p-sofa2"/><rect x="232" y="56" width="8" height="52" rx="4" class="p-sofa2"/>
-      <ellipse cx="160" cy="82" rx="18" ry="11" class="p-wood"/><circle cx="154" cy="80" r="2.5" class="p-cup"/>
-      <rect x="122" y="96" width="14" height="14" rx="4" class="p-sofa2"/><rect x="184" y="96" width="14" height="14" rx="4" class="p-sofa2"/>`, 160, 121)}
-    ${zone('long', 'x="98" y="136" width="124" height="172"', `
-      <rect x="138" y="146" width="44" height="152" rx="3" class="p-wood"/>${chairs.join('')}${lamps}`, 160, 300)}
-    ${zone('listening', 'x="14" y="136" width="76" height="172"', `
-      <rect x="30" y="152" width="52" height="138" rx="10" class="p-rug2"/>
-      <rect x="16" y="150" width="14" height="66" class="p-wood"/><circle cx="23" cy="164" r="5" class="p-record"/><circle cx="23" cy="182" r="5" class="p-record"/><circle cx="23" cy="200" r="5" class="p-record"/>
-      <rect x="40" y="170" width="14" height="14" rx="4" class="p-sofa"/><rect x="62" y="170" width="14" height="14" rx="4" class="p-sofa"/>
-      <rect x="40" y="208" width="14" height="14" rx="4" class="p-sofa"/><rect x="62" y="208" width="14" height="14" rx="4" class="p-sofa"/>
-      <rect x="40" y="246" width="14" height="14" rx="4" class="p-sofa"/><rect x="62" y="246" width="14" height="14" rx="4" class="p-sofa"/>`, 52, 300)}
-    ${zone('study', 'x="232" y="136" width="78" height="172"', `${study(140)}${study(222)}
-      <text x="296" y="152" text-anchor="end" class="p-label">A</text><text x="296" y="234" text-anchor="end" class="p-label">B</text>`, 271, 300)}
-    <path d="M108 380a52 34 0 0 1 104 0z" class="p-stage"/><path d="M160 356v14M156 356h8" class="p-mic"/><circle cx="160" cy="354" r="2.2" class="p-micc"/>
-    <text x="160" y="377" text-anchor="middle" class="p-label">STAGE · 不插电</text>
-    <rect x="8" y="8" width="304" height="404" class="p-wall"/>
-    <rect x="138" y="406" width="44" height="10" fill="url(#parq)"/><path d="M138 410a14 14 0 0 1 14-14M182 410a14 14 0 0 0-14-14" class="p-swing"/>
-    <text x="160" y="396" text-anchor="middle" class="p-label p-label--muted">ENTRANCE · 入口</text>
-  </svg>`);
+  if (me.identity === 'member_expired') return html`<div class="banner"><b>会员已到期</b><p>${me.membership.can_renew ? `到期 30 天内续费不需重新审核。` : '到期已超过 30 天，需要重新申请。'}</p><a class="btn btn--sm" href="#/me">${me.membership.can_renew ? '续费' : '重新申请'}</a></div>`;
+  return '';
 }
 
-/* ---------- welcome / login / apply / status ---------- */
-function viewWelcome() {
-  return html`<main class="main main--bare"><div class="welcome">
-    <div class="welcome__frame">
-      <div>
-        <p class="welcome__k">A members’ club · 会员制线下俱乐部</p>
-        <h1 class="welcome__word">Something<br>Ventured</h1>
-        <p class="welcome__tag">Nothing ventured, nothing gained.</p>
-      </div>
-      <div class="welcome__house">${houseSVG()}</div>
-      <p class="welcome__note"><b>By referral only · 仅限推荐</b>3F Library · 杭州 · 12.15 开业<br>一个身份，打开每一扇门。</p>
-      <div class="btns">
-        <a class="btn btn--accent" href="#/login">I have a key<span>我是会员 · 登录</span></a>
-        <a class="btn btn--ghost" href="#/apply">I was referred<span>申请推荐入会</span></a>
-        <a class="link" style="justify-self:center" href="#/login">已提交申请？登录查看进度 ${icon('arrow')}</a>
-      </div>
+/* ---------- home ---------- */
+function viewHome(d) { return term() ? homeTerminal(d) : homeLibrary(d); }
+
+function playbill(t) {
+  if (!t) return html`<div class="bill"><p class="bill__k">Tonight · 今晚</p><p class="bill__t">今晚没有演出</p></div>`;
+  const s = t.session;
+  const guestFrom = minFrom(t.zones, 'guest');
+  const memberFrom = minFrom(t.zones, 'member');
+  return html`<article class="bill">
+    <p class="bill__k">${s.date === tonightHZ() ? 'Tonight · 今晚节目单' : 'Next · 下一场'} · ${fmt.mdOf(s.date)} ${fmt.dowOf(s.date)}</p>
+    <h2 class="bill__t">${s.title}</h2><p class="bill__en">${s.en}</p><p class="bill__by">演出 · ${s.performers}</p>
+    <p class="bill__time">${s.show_start} 开场 · ${s.hold_deadline} 留位截止</p>
+    <div class="idx">${t.zones.map(z => { const zz = zoneOf(z.id); return html`<div class="idx__r ${z.sealed && !z.free ? 'is-sealed' : ''}"><b>${zz.zh}</b><i></i><span>${zoneAvail(z)}</span></div>`; })}</div>
+    <div class="price">
+      ${t.ticket_sales ? html`<div>散台 · 拼桌 · 吧台：门票 <b>${yuan(t.ticket_price)}</b> / 人，含${t.ticket_drink}；会员免票</div>` : html`<div>门票暂未开售；会员散台、拼桌照常。</div>`}
+      <div>卡座低消：会员 <b>${yuan(memberFrom)}</b> 起 · 非会员 <b>${yuan(guestFrom)}</b> 起；订金为低消的 30%</div>
     </div>
-  </div></main>`;
+    <div class="btns" style="margin-top:16px"><a class="btn btn--block" href="#/book">按区域订座 · 购票</a></div>
+  </article>`;
 }
 
-function viewLogin() {
-  return html`${bar({ title: '前台', sub: 'The Front Desk', back: 'welcome' })}
-  <main class="main main--plain">
-    <div class="titlecard"><p class="kicker">The Front Desk</p><h1 class="h1">前台登记</h1><p class="lede">Welcome back. Your key, please.</p></div>
-    <form class="regcard" data-form="login" novalidate>
-      <div class="regcard__head"><b>Sign in · 登录</b><span>SV · HZ · 301</span></div>
-      <label class="field"><span class="field__l"><b>Mobile</b><span>手机号</span></span>
-        <input class="input input--mono" name="phone" inputmode="numeric" autocomplete="tel" placeholder="138 0000 0007" maxlength="13" required></label>
-      <label class="field"><span class="field__l"><b>Code</b><span>验证码</span></span>
-        <span class="inline"><input class="input input--mono" name="code" inputmode="numeric" autocomplete="one-time-code" maxlength="4" placeholder="····" required>
-        <button type="button" class="codebtn" data-act="send-code">获取验证码</button></span></label>
-      <p class="form-err" data-err></p>
-      <button class="btn btn--accent btn--block">Enter<span>进入</span></button>
-      <p class="regcard__foot">会员与申请人都用手机号登录。</p>
-    </form>
-    <div class="demo">
-      <p class="demo__k">Demo · 演示入口</p>
-      <div class="btns">
-        <button class="btn btn--ghost" data-act="demo" data-as="member">演示会员<span>林知远 · No.0007</span></button>
-        <button class="btn btn--ghost" data-act="demo" data-as="applicant">演示申请人<span>宋予安 · 尽调中</span></button>
-      </div>
-      <p class="muted" style="font-size:12px">演示验证码 ${DEMO_CODE}</p>
-    </div>
-  </main>`;
+function teaserCard(c) {
+  return html`<a class="teaser" href="#/content/${c.key}">
+    <p class="teaser__k">Members’ stacks · 会员馆藏</p><p class="teaser__t">${c.teaser.title}</p><p class="teaser__p">${c.teaser.hook}</p>
+    <div class="teaser__redact" aria-hidden="true"><i></i><i></i><i></i></div>
+    <span class="stamp">Restricted<small>会员可见</small></span></a>`;
 }
 
-function choiceGroup(name, options, value) {
-  return html`<div class="choice" role="radiogroup">${options.map(([v, label]) => html`<label class="chip ${value === v ? 'is-on' : ''}"><input class="sr" type="radio" name="${name}" value="${v}" ${raw(value === v ? 'checked' : '')}>${label}</label>`)}</div>`;
-}
-
-function viewApply() {
-  const inv = S.ui.inviteInfo;
-  return html`${bar({ title: '申请推荐入会', sub: 'Request an introduction', back: S.role === 'applicant' ? 'status' : 'welcome' })}
-  <main class="main main--plain">
-    <div class="titlecard"><p class="kicker">Chapter Six · 第六章</p><h1 class="h1">按响前台的铃</h1><p class="lede">In which you ring the bell.</p></div>
-    ${inv ? html`<div class="envelope" style="margin:0 18px 22px">
-        <svg class="envelope__seal"><use href="#i-seal"/></svg>
-        <p class="envelope__k">An invitation · 推荐函</p>
-        <p class="envelope__p"><b>${inv.lead}</b> 推荐了你。<br>补全下面的登记卡，礼宾台会开始筛选。</p>
-      </div>` : ''}
-    <form class="regcard" data-form="apply" novalidate>
-      <div class="regcard__head"><b>Registration · 登记卡</b><span>Non-binding</span></div>
-      <label class="field"><span class="field__l"><b>Invitation</b><span>邀请码 <i>有则填写</i></span></span>
-        <span class="inline"><input class="input input--mono" name="invite" placeholder="SV-XXXX" maxlength="8" autocapitalize="characters" value="${S.ui.invite || ''}">
-        <button type="button" class="codebtn" data-act="check-invite">核对</button></span></label>
-      <label class="field"><span class="field__l"><b>Name</b><span>姓名 <i>*</i></span></span><input class="input" name="name" autocomplete="name" maxlength="30" value="${inv ? inv.name : ''}"></label>
-      <label class="field"><span class="field__l"><b>Venture & role</b><span>公司 / 职位 <i>*</i></span></span><input class="input" name="venture" maxlength="60" placeholder="例：远望机器人 · 创始人" value="${inv && inv.venture !== '待补充' ? inv.venture : ''}"></label>
-      <div class="field"><span class="field__l"><b>Sector</b><span>领域 <i>*</i></span></span>${choiceGroup('sector', SECTORS.map(s => [s.id, s.id === 'Robotics' ? 'Robotics 机器人' : s.id === 'Frontier' ? '其他前沿' : s.en]), inv ? inv.sector : '')}</div>
-      <div class="field"><span class="field__l"><b>Base</b><span>常驻城市 <i>*</i></span></span>${choiceGroup('base', BASES.map(b => [b, b]), inv ? inv.base : '')}</div>
-      <label class="field"><span class="field__l"><b>Lead</b><span>推荐人 <i>选填</i></span></span><input class="input" name="lead" maxlength="30" value="${inv ? inv.lead : ''}" ${raw(inv ? 'readonly' : '')} placeholder="推荐你的会员"></label>
-      <label class="field"><span class="field__l"><b>Mobile</b><span>手机号 <i>*</i></span></span><input class="input input--mono" name="phone" inputmode="numeric" autocomplete="tel" maxlength="13" placeholder="用来登录查看进度"></label>
-      <label class="field"><span class="field__l"><b>WeChat</b><span>微信号 <i>选填</i></span></span><input class="input" name="wechat" maxlength="40"></label>
-      <label class="field"><span class="field__l"><b>Thesis</b><span>最近在押注什么？ <i>选填</i></span></span><textarea class="textarea" name="thesis" maxlength="300" rows="3"></textarea></label>
-      <p class="form-err" data-err></p>
-      <button class="btn btn--accent btn--block btn--row">${icon('bell')}Ring for service<span>提交申请</span></button>
-      <p class="regcard__foot">本申请不具约束力，以俱乐部筛选结果为准。</p>
-    </form>
-  </main>`;
-}
-
-function viewStatus(d) {
-  const a = d.application;
-  const step = a.step;
-  const heads = {
-    received: ['Received · 已收到', '尽调进行中', 'Due diligence in progress.'],
-    diligence: ['In diligence · 尽调中', '尽调进行中', 'Due diligence in progress.'],
-    initiation: ['You are invited · 已邀请', '入会仪式', 'In which one is welcomed.'],
-    welcomed: ['Welcome · 欢迎', '欢迎入会', 'One key. Every door.'],
-    declined: ['Thank you · 感谢', '感谢你的申请', 'Not this time.'],
-  };
-  const [k, h, lede] = heads[a.stage] || heads.received;
-  const stamp = a.stage === 'initiation' ? ['Invited', '已邀请'] : a.stage === 'welcomed' ? ['Welcome', '欢迎'] : a.stage === 'declined' ? null : ['In diligence', '尽调中'];
-  const desc = [
-    a.lead ? `由 ${a.lead} 推荐` : '已收到你的申请',
-    `我们会通过 ${maskPhone(store.get('sv.app.phone') || '') || '你留下的联系方式'} 与你联系。`,
-    a.initiationAt ? `${fmt.full(a.initiationAt)} · 形式，入会时揭晓。` : '一场专门的入会仪式。形式，入会时揭晓。',
-    a.memberNo ? `会员编号 No.${a.memberNo}` : '入会礼包、虚拟会员身份，以及专门的服务人员。',
-  ];
-  return html`${bar({ word: true, right: html`<button class="iconbtn" data-act="logout" aria-label="退出登录">${icon('close')}</button>` })}
-  <main class="main main--plain">
-    <div class="titlecard"><p class="kicker">${k}</p><h1 class="h1">${h}</h1><p class="lede">${lede}</p></div>
-    <div style="padding:4px 26px 10px">${memberCard({ name: a.name, en: a.en, sector: a.sector, base: a.base, no: a.memberNo, lead: a.lead }, { stamp })}</div>
-    ${a.stage === 'welcomed' ? html`<div style="padding:16px 22px 0"><button class="btn btn--brass btn--block btn--row" data-act="upgrade">${icon('key')}Receive your key<span>领取你的钥匙</span></button></div>` : ''}
-    ${!a.completed && a.invite ? html`<div style="padding:16px 22px 0"><a class="btn btn--accent btn--block" href="#/apply?invite=${a.invite}">Complete your card<span>补全登记卡</span></a></div>` : ''}
-    ${a.stage === 'initiation' && a.initiationAt ? html`<div class="invite">
-      <svg class="invite__seal"><use href="#i-seal"/></svg>
-      <p class="invite__k">Initiation · 入会仪式</p>
-      <p class="invite__t">${fmt.md(a.initiationAt)} ${fmt.dow(a.initiationAt)} · ${fmt.time(a.initiationAt)}</p>
-      <p class="invite__d">3F LIBRARY · HANGZHOU</p>
-      <p class="invite__p">形式，入会时揭晓。请准时到达。</p>
-    </div>` : ''}
-    ${a.stage === 'declined' ? html`<p class="lede" style="text-align:center;padding:18px 30px 0;font-size:15px">这一次没能成行。俱乐部会在合适的时候，再与你联系。</p>` : html`
-    <ol class="path" style="margin-top:22px">${PATH.map((p, i) => html`<li class="${i < step || a.stage === 'welcomed' ? 'is-done' : i === step ? 'is-now' : ''}">
-      <span class="path__n">${i < step || a.stage === 'welcomed' ? icon('check') : '0' + (i + 1)}</span>
-      <span class="path__t"><b>${p.zh}</b><span>${p.en}</span><p>${desc[i]}</p></span></li>`)}</ol>`}
-    ${d.notices.length ? html`<section class="section" style="margin-top:18px"><div class="sechead"><div class="sechead__t"><b>来信</b><span>Letters</span></div></div>
-      ${d.notices.map(n => html`<div class="notice"><span class="notice__i">${icon('bell')}</span><div><div class="notice__t"><b>${n.title}</b><small>${fmt.rel(n.at)}</small></div><p>${n.body}</p></div></div>`)}</section>` : ''}
+function homeLibrary(d) {
+  const m = d.mode;
+  const teasers = d.content.filter(c => c.mode === 'any' || c.mode === m || (m === 'closed' && c.mode === 'night'));
+  const dayCover = d.content.find(c => c.key === 'membertime');
+  const evs = d.events.slice(0, 3);
+  return html`${masthead()}<main class="main">
+    ${statusBanner()}
+    ${m === 'day' && dayCover ? html`<section class="section"><div class="sh"><b>白天属于会员</b><span>Members’ hours</span></div>
+      <a class="teaser" href="#/content/membertime"><p class="teaser__k">10:00 – ${d.switch_at} · Members only</p><p class="teaser__t">${dayCover.teaser.title}</p><p class="teaser__p">${dayCover.teaser.hook} 非会员白天不开放，${d.switch_at} 以后见。</p><div class="teaser__redact" aria-hidden="true"><i></i><i></i></div><span class="stamp">Members<small>会员时间</small></span></a></section>` : ''}
+    ${m === 'closed' ? html`<section class="section"><div class="ccard"><div class="ccard__call"><span>CLOSED</span><span>${d.day_open_at}</span></div><p class="ccard__t">现在打烊</p><p class="ccard__p">${d.day_open_at} 开门（白天为会员时间），${d.switch_at} 起为演出夜。线上订座照常。</p></div></section>` : ''}
+    ${playbill(d.tonight)}
+    ${d.mine && d.mine.length ? html`<section class="section"><div class="sh"><b>我的预订</b><span>On loan</span></div>${d.mine.map(b => orderCard(b))}</section>` : ''}
+    <section class="section"><div class="sh"><b>会员馆藏</b><span>Trailers</span></div>
+      <div class="teasers">${teasers.filter(c => c.key !== 'membertime' || m !== 'day').map(teaserCard)}</div>
+      <p class="note">会员内容只露出封面；正文在入会之后。</p></section>
+    <section class="section"><div class="sh"><b>近期活动</b><span>Programme</span></div>${evs.map(e => eventCard(e))}<a class="link" href="#/events" style="margin-top:10px">全部活动 ${icon('arrow')}</a></section>
     <p class="motto">Nothing ventured, nothing gained.</p>
   </main>`;
 }
 
-/* ---------- lobby ---------- */
-function viewLobby(d) {
-  const me = d.me;
-  const [gEn, gZh] = greeting();
-  const lib = d.floors.find(f => f.id === 'library');
-  const unread = d.unread;
-  const boardSt = f => {
-    const s = f.state.key;
-    if (s === 'planned') return html`<span class="board__st is-off">Planned</span>`;
-    if (s === 'soon') return html`<span class="board__st is-soon">Opens ${fmt.mdOf(f.openingDate)}</span>`;
-    if (s === 'day' || s === 'night') return html`<span class="board__st is-live">Open · ${s}</span>`;
-    return html`<span class="board__st is-off">Closed</span>`;
-  };
-  const showInstall = !isStandalone() && !store.get('sv.install.dismissed');
-  return html`${bar({ word: true, right: html`<button class="iconbtn" data-act="notices" aria-label="来信与通知${unread ? '，有未读' : ''}">${icon('bell')}${unread ? html`<span class="iconbtn__dot"></span>` : ''}</button>` })}
-  <main class="main">
-    <div class="greet">
-      <p class="kicker">${gEn} · ${gZh}</p>
-      ${me.en ? html`<p class="greet__name">${me.en}</p><p class="greet__zh">${me.name}</p>` : html`<p class="greet__name" style="font:600 26px/1.3 var(--sans);letter-spacing:.2em">${me.name}</p>`}
-      <p class="greet__meta">NO. ${me.no} · ${sectorOf(me.sector).en.toUpperCase()} · ${me.base}</p>
-    </div>
-    <div class="house">${houseSVG(d.floors)}<span class="house__snow"></span></div>
-    <div class="board" role="list" aria-label="楼层指南">
-      <div class="board__k"><span>Directory · 楼层指南</span><span>HZ · 杭州</span></div>
-      ${d.floors.map(f => html`<div class="board__row" role="listitem"><span class="board__fl">${f.floor}</span><span class="board__nm">${f.name}<small>${f.zh}</small></span><span class="board__dots"></span>${boardSt(f)}</div>`)}
-    </div>
-    ${lib && lib.state.key === 'soon' ? html`<div class="countdown"><div class="countdown__l"><b>Opening in</b><span>距 3F Library 开业</span></div>${flaps(String(lib.state.days).padStart(2, '0'))}<div class="countdown__l" style="text-align:left"><b>Days</b><span>天</span></div></div>` : ''}
-    ${showInstall ? html`<div class="install">${icon('addbox')}<div><b>把钥匙放进手机桌面</b><span>添加到主屏幕，像 App 一样打开</span></div><span style="display:flex;gap:2px"><button class="btn btn--sm" data-act="install">添加</button><button class="iconbtn install__x" data-act="install-dismiss" aria-label="不再提示">${icon('close')}</button></span></div>` : ''}
-
-    <section class="section" style="margin-top:26px">
-      <div class="sechead"><div class="sechead__t"><b>接下来</b><span>Up next</span></div><a class="link" href="#/programme">节目单 ${icon('arrow')}</a></div>
-      <div class="stack">${d.upcoming.length ? d.upcoming.map(u => u.kind === 'event' ? ticket(u.item, { compact: true }) : keytag(u.item))
-        : html`<div class="empty"><b>Nothing booked yet.</b>还没有安排。去「节目」或「预订」看看？</div>`}</div>
-    </section>
-
-    ${d.bulletins.length ? html`<section class="section" style="margin-top:28px">
-      <div class="sechead"><div class="sechead__t"><b>礼宾台来信</b><span>From the desk</span></div></div>
-      <button class="letter" data-act="notices"><svg class="letter__seal"><use href="#i-seal"/></svg>
-        <span class="letter__k">${fmt.rel(d.bulletins[0].at)} · Bulletin</span>
-        <p class="letter__t">${d.bulletins[0].title}</p><p class="letter__b">${d.bulletins[0].body}</p>
-        <p class="letter__f">— The Front Desk · 礼宾台</p></button>
-    </section>` : ''}
-
-    ${me.host ? html`<section class="section" style="margin-top:22px">
-      <div class="host"><span class="cameo">${initialOf(me.host.name)}</span>
-        <div><p class="host__k">Your host · 专属服务</p><p class="host__n">${me.host.name}<i>${me.host.en}</i></p><p class="host__r">${me.host.role} · 有需要，按铃即可</p></div>
-        <button class="ring" data-act="concierge">${icon('bell')}RING</button></div>
-    </section>` : ''}
-
-    ${d.spotlight.length ? html`<section class="section" style="margin-top:26px">
-      <div class="sechead"><div class="sechead__t"><b>近期节目</b><span>Coming attractions</span></div></div>
-      <div class="posters">${d.spotlight.map(e => { const p = fmt.parts(e.startsAt); return html`<button class="poster c-${e.color}" data-act="event" data-id="${e.id}"><span class="poster__k">${typeOf(e.type).en}</span><span class="poster__d">${p.d}<small>${p.mon} · ${p.dowEn}</small></span><span class="poster__t">${e.title}</span></button>`; })}</div>
-    </section>` : ''}
-    <p class="motto">No moments in this club were generated.<small>本俱乐部内的一切时刻，均未经生成</small></p>
+function homeTerminal(d) {
+  const m = d.mode;
+  const me = S.me;
+  const mem = d.member || {};
+  const visible = d.content;
+  const memo = visible.find(c => c.key === 'memo');
+  const after = visible.find(c => c.key === 'afterhours');
+  const t = d.tonight;
+  const zoneLines = t ? t.zones.map(z => { const zz = zoneOf(z.id); const frac = z.total ? (z.total - z.free) / z.total : 0; return `${zz.en.padEnd(17).slice(0, 17)} ${bar(frac, 10)} ${String(z.free).padStart(2)}/${z.total}${z.unit === 'seat' ? 's' : 'b'}`; }).join('\n') : '';
+  return html`${header('library-live')}<main class="main">
+    <pre class="fig" data-act="fig" aria-label="sth.ventured">${FIG.brand.join('\n')}</pre>
+    <div class="section" style="margin-top:6px"><p class="prompt"><span>whoami → ${me.user.name} · member #${me.user.member_no} · layer ${Math.max(1, ...visible.filter(c => !c.locked).map(c => c.layer))}</span></p>
+      <p class="prompt"><span>mode → ${m} (${m === 'day' ? `10:00–${d.switch_at} members' hours` : m === 'night' ? `${d.switch_at}–${d.night_close_at} live` : `opens ${d.day_open_at}`})</span></p></div>
+    ${m === 'closed' ? html`<pre class="fig fig--sm">${FIG.closed.join('\n')}</pre>` : ''}
+    ${m === 'day' ? html`
+      <section class="panel"><span class="panel__t" data-scramble>CHECK-IN</span><span class="panel__r">${mem.checkin.here} here</span>
+        ${mem.checkin.today ? html`<p class="out">checked in · ${fmt.time(mem.checkin.at)} · +${mem.checkin.companions} guests</p><button class="btn btn--sm" style="margin-top:10px" data-act="checkin">STATUS</button>`
+          : html`<p class="out">白天到店，扫门口今天的签到码。朋友不用注册，填人数即可。</p><button class="btn btn--primary btn--block" style="margin-top:12px" data-act="checkin">CHECK IN · 签到</button>`}
+      </section>
+      <section class="panel"><span class="panel__t" data-scramble>ROUNDTABLES</span><span class="panel__r">open salon</span>
+        ${mem.roundtables.length ? html`<div class="ls">${mem.roundtables.map(e => html`<button class="ls__r" data-act="event" data-id="${e.id}"><span class="ls__m">${fmt.time(e.start_at)}</span><span class="ls__t">${e.title}<small>host ${e.host} · ${e.taken}/${e.capacity}</small></span><span class="ls__a">${e.mine ? html`<span class="tag tag--inv">IN</span>` : '[JOIN]'}</span></button>`)}</div>` : html`<p class="out">今天没有排座谈。适合读书。</p>`}
+      </section>
+      <section class="panel"><span class="panel__t" data-scramble>MEETINGS</span>
+        ${mem.meetings.length ? html`<div class="ls">${mem.meetings.map(x => meetingRow(x))}</div>` : html`<p class="out">多人会议需要留座、摆桌椅时，提前申请。</p>`}
+        <button class="btn btn--sm" style="margin-top:10px" data-act="meeting-new">NEW REQUEST · 申请会议</button>
+      </section>` : ''}
+    ${m !== 'day' && t ? html`
+      <section class="panel"><span class="panel__t" data-scramble>RESERVED FOR YOU</span><span class="panel__r">until ${d.switch_at}</span>
+        <div class="ls">${mem.reserved.map(r => html`<div class="ls__r"><span class="ls__m">${r.code}</span><span class="ls__t">${resourceOf(r.code).card.name} · 舞台前圆卡座<small>${resourceOf(r.code).card.story}</small></span><span class="ls__a">${r.state === 'reserved_open' ? html`<span class="tag tag--inv">OPEN</span>` : r.state === 'mine' ? html`<span class="tag tag--inv">YOURS</span>` : html`<span class="tag">HELD</span>`}</span></div>`)}</div>
+        <a class="btn btn--primary btn--block" style="margin-top:12px" href="#/book?zone=round">BOOK THE ROUNDS</a>
+      </section>` : ''}
+    ${t ? html`<section class="panel"><span class="panel__t" data-scramble>${m === 'day' ? 'TONIGHT' : 'NOW SHOWING'}</span><span class="panel__r">${fmt.mdOf(t.session.date)} ${t.session.show_start}</span>
+      <p class="out"><b>${t.session.title}</b> · ${t.session.en}\nact  ${t.session.performers}\n\n${zoneLines}</p>
+      <a class="btn btn--sm" style="margin-top:10px" href="#/book">OPEN FLOOR PLAN</a></section>` : ''}
+    ${memo ? html`<section class="panel"><span class="panel__t" data-scramble>MEMO</span><span class="panel__r">weekly</span>
+      <p class="out">${memo.teaser.title}\n${memo.teaser.hook}</p><a class="btn btn--sm" style="margin-top:10px" href="#/content/memo">READ</a></section>` : ''}
+    ${after && m !== 'day' ? html`<section class="panel"><span class="panel__t" data-scramble>AFTER HOURS</span><span class="panel__r">night only</span><p class="out">${after.teaser.hook}</p><a class="btn btn--sm" style="margin-top:10px" href="#/content/afterhours">OPEN</a></section>` : ''}
+    ${hiddenPanel(visible)}
+    ${d.mine && d.mine.length ? html`<section class="panel"><span class="panel__t">ORDERS</span><div class="ls">${d.mine.map(b => html`<a class="ls__r" href="#/order/${b.id}"><span class="ls__m">${fmt.mdOf(b.date)}</span><span class="ls__t">${zoneOf(b.zone).zh} · ${b.party_size} 人<small>${b.code}</small></span><span class="ls__a">${b.label.deal}</span></a>`)}</div></section>` : ''}
+    <p class="motto">no moments in this club were generated.</p>
   </main>`;
 }
-
-function flaps(text) {
-  return html`<span class="flaps" aria-label="${text}">${[...String(text)].map(c => html`<span class="fc">${c}</span>`)}</span>`;
+const RULE_HINT = { checkin_count: '白天签到一次后解锁', event_attended: '到场参加一次活动后解锁', hosted_session: '做过一次分享后解锁', staff_grant: '由店长授予', easter_egg: '藏在某个角落' };
+function hiddenPanel(items) {
+  const deep = items.filter(c => c.layer >= 1);
+  return html`<section class="panel"><span class="panel__t" data-scramble>LS -LA /HIDDEN</span><span class="panel__r">L1–L3</span>
+    <div class="ls">${deep.map(c => c.locked
+      ? html`<div class="ls__r is-locked"><span class="ls__m">d---------</span><span class="ls__t">${c.teaser.title}<small>${RULE_HINT[c.rule] || ''}</small></span><span class="ls__a">${icon('lock')}</span></div>`
+      : html`<a class="ls__r" href="#/content/${c.key}"><span class="ls__m">drwx------</span><span class="ls__t">${c.teaser.title}<small>L${c.layer}${c.dim ? ' · 现在不在时段内' : ''}</small></span><span class="ls__a">&gt;</span></a>`)}</div></section>`;
+}
+function meetingRow(x) {
+  const st = { submitted: '待门店确认', accepted: '已确认', counter_proposed: '门店提议调整', user_accepted: '已确认', rejected: '未能安排', user_declined: '已婉拒', cancelled: '已取消' }[x.status];
+  return html`<div class="ls__r"><span class="ls__m">${fmt.mdOf(x.date)}</span><span class="ls__t">${x.start}–${x.end} · ${x.party_size} 人<small>${st}${x.counter && x.status === 'counter_proposed' ? ` → ${x.counter.start}–${x.counter.end} · ${x.counter.note}` : x.reply ? ` · ${x.reply}` : ''}</small></span>
+    <span class="ls__a">${x.status === 'counter_proposed' ? html`<button class="btn btn--sm" data-act="meeting-respond" data-id="${x.id}" data-v="1">OK</button>` : ''}</span></div>`;
 }
 
-/* ---------- programme ---------- */
-function viewProgramme(list) {
-  const f = S.ui.filter;
-  const types = [...new Set(list.map(e => e.type))];
-  const pass = e => f === 'all' || (f === 'mine' ? !!e.mine : e.type === f);
-  const upcoming = list.filter(e => !e.past && pass(e));
+/* ---------- events ---------- */
+function eventCard(e) {
+  const k = EVENT_KINDS[e.kind];
+  if (e.locked) {
+    return html`<button class="teaser ccard--btn" style="margin-top:12px" data-act="event" data-id="${e.id}"><p class="teaser__k">${k.en} · ${fmt.mdOf(e.start_at.slice(0, 10))} ${fmt.time(e.start_at)}</p><p class="teaser__t">${e.title}</p><p class="teaser__p">${e.hook}</p><div class="teaser__redact" aria-hidden="true"><i></i><i></i></div><span class="stamp">Members<small>会员活动</small></span></button>`;
+  }
+  return html`<button class="ccard ccard--btn" style="margin-top:12px" data-act="event" data-id="${e.id}">
+    <div class="ccard__call"><span>${k.en.toUpperCase()} · ${e.id.toUpperCase()}</span><span>${fmt.md(e.start_at)} ${fmt.time(e.start_at)}</span></div>
+    <p class="ccard__t">${e.title}</p><p class="ccard__en">${e.en || ''}</p>
+    <p class="ccard__p">${e.host ? `主持 ${e.host} · ` : ''}${e.location} · ${e.left > 0 ? `余 ${e.left} / ${e.capacity}` : '已满'}${e.layer === 0 ? ' · 公开' : ''}</p>
+    ${e.mine ? html`<span class="stamp stamp--purple stamp--abs">${e.mine === 'attended' ? 'Attended' : 'Registered'}<small>${e.mine === 'attended' ? '已到场' : '已报名'}</small></span>` : ''}</button>`;
+}
+function viewEvents(list) {
+  const f = S.ui.evFilter;
+  const pass = e => f === 'all' || (f === 'public' ? e.layer === 0 : f === 'members' ? e.layer === 1 : f === 'mine' ? !!e.mine : e.kind === f);
+  const up = list.filter(e => !e.past && pass(e));
   const past = list.filter(e => e.past && pass(e));
-  return html`${bar({ title: '节目单', sub: 'The Programme' })}
-  <main class="main">
-    <div class="marquee"><p class="marquee__k">Now showing · 正在上映</p><p class="marquee__t">Programme</p><p class="marquee__z">会员专享节目</p></div>
-    <div class="filters"><div class="chips chips--scroll">
-      <button class="chip" aria-pressed="${String(f === 'all')}" data-act="filter" data-v="all">全部</button>
-      <button class="chip" aria-pressed="${String(f === 'mine')}" data-act="filter" data-v="mine">我的票</button>
-      ${types.map(t => html`<button class="chip" aria-pressed="${String(f === t)}" data-act="filter" data-v="${t}">${typeOf(t).zh}</button>`)}
-    </div></div>
-    <section class="section"><div class="stack">${upcoming.length ? upcoming.map(e => ticket(e)) : html`<div class="empty"><b>Intermission.</b>这里暂时没有节目。</div>`}</div></section>
-    ${past.length ? html`<section class="section" style="margin-top:28px"><div class="sechead"><div class="sechead__t"><b>往期</b><span>Previously</span></div></div><div class="stack">${past.map(e => ticket(e, { compact: true }))}</div></section>` : ''}
-    <p class="motto">The following picture has been approved for those who venture.</p>
+  const chips = [['all', '全部'], ['public', '公开'], ['members', '会员'], ['roundtable', '座谈'], ['mine', '我的']];
+  if (term()) {
+    return html`${header('events')}<main class="main">
+      <div class="section" style="margin-top:14px"><div class="chips">${chips.map(([v, l]) => html`<button class="chip" aria-pressed="${String(f === v)}" data-act="ev-filter" data-v="${v}">${l}</button>`)}</div></div>
+      <section class="panel"><span class="panel__t" data-scramble>UPCOMING</span><span class="panel__r">${up.length}</span>
+        <div class="ls">${up.length ? up.map(e => html`<button class="ls__r" data-act="event" data-id="${e.id}"><span class="ls__m">${fmt.mdOf(e.start_at.slice(0, 10))} ${fmt.time(e.start_at)}</span><span class="ls__t">${e.title}<small>${EVENT_KINDS[e.kind].en.toLowerCase()} · ${e.taken}/${e.capacity}${e.layer === 0 ? ' · public' : ''}</small></span><span class="ls__a">${e.mine ? html`<span class="tag tag--inv">IN</span>` : e.left ? '[+]' : html`<span class="tag">FULL</span>`}</span></button>`) : html`<p class="out">nothing scheduled.</p>`}</div></section>
+      ${past.length ? html`<section class="panel"><span class="panel__t">ARCHIVE</span><div class="ls">${past.map(e => html`<button class="ls__r" data-act="event" data-id="${e.id}"><span class="ls__m">${fmt.mdOf(e.start_at.slice(0, 10))}</span><span class="ls__t">${e.title}<small>${e.mine === 'attended' ? 'attended → 现场回放已解锁' : 'past'}</small></span><span class="ls__a">${e.mine === 'attended' ? html`<span class="tag tag--inv">✓</span>` : ''}</span></button>`)}</div></section>` : ''}
+    </main>`;
+  }
+  return html`${header('活动', 'Programme')}<main class="main">
+    <div class="section" style="margin-top:14px"><div class="chips">${chips.map(([v, l]) => html`<button class="chip" aria-pressed="${String(f === v)}" data-act="ev-filter" data-v="${v}">${l}</button>`)}</div></div>
+    <section class="section" style="margin-top:6px">${up.length ? up.map(eventCard) : html`<p class="empty">这里暂时没有活动。</p>`}</section>
+    ${past.length ? html`<section class="section"><div class="sh"><b>往期</b><span>Archive</span></div>${past.map(eventCard)}</section>` : ''}
+    <p class="motto">科创 panel、播客录制与开放座谈。会员常规活动免费。</p>
   </main>`;
 }
-
-function sheetEvent({ id, admitted }) {
-  const list = S.data.programme || [];
-  const lob = S.data.lobby;
-  const e = list.find(x => x.id === id) || (lob && [...lob.spotlight, ...lob.upcoming.filter(u => u.kind === 'event').map(u => u.item)].find(x => x.id === id));
-  if (!e) return { body: html`<p class="empty">找不到这场活动。</p>` };
-  const p = fmt.parts(e.startsAt);
-  const t = typeOf(e.type);
-  const pct = Math.min(100, Math.round((e.taken / e.capacity) * 100));
+function sheetEvent({ id }) {
+  const e = (S.data.events || []).find(x => x.id === id) || (S.data.home && S.data.home.events.find(x => x.id === id)) || S.sheet.event;
+  if (!e) return { body: html`<p class="empty">…</p>` };
+  const k = EVENT_KINDS[e.kind];
+  const me = S.me;
+  if (e.locked) {
+    return { label: e.title, body: html`<div class="sheet__h"><span>${k.en} · 会员活动</span><b>${e.title}</b></div>
+      <div class="teaser"><p class="teaser__k">${fmt.full(e.start_at)}</p><p class="teaser__t">${e.title}</p><p class="teaser__p">${e.hook}</p><div class="teaser__redact" aria-hidden="true"><i></i><i></i><i></i></div><span class="stamp">Members<small>会员活动</small></span></div>
+      <p class="note">会员活动只露出封面。入会后可以看到全部内容并报名。</p>`, foot: me.user ? html`<a class="btn btn--block" href="#/me">申请入会</a>` : html`<a class="btn btn--block" href="#/login">登录</a>` };
+  }
   let cta;
-  if (e.past) cta = html`<button class="btn btn--ghost btn--block" disabled>Ended<span>已结束</span></button>`;
-  else if (e.mine === 'going') cta = html`<button class="btn btn--ghost btn--block" data-act="unrsvp" data-id="${e.id}">Cancel my seat<span>取消报名</span></button>`;
-  else if (e.mine === 'waitlist') cta = html`<button class="btn btn--ghost btn--block" data-act="unrsvp" data-id="${e.id}">Leave the waitlist<span>退出候补 · 前面还有人</span></button>`;
-  else if (e.left > 0) cta = html`<button class="btn btn--accent btn--block" data-act="rsvp" data-id="${e.id}">Reserve a seat<span>报名 · 余 ${e.left} 席</span></button>`;
-  else cta = html`<button class="btn btn--block" data-act="rsvp" data-id="${e.id}">Join the waitlist<span>已满 · 加入候补</span></button>`;
+  if (e.past) cta = html`<button class="btn btn--ghost btn--block" disabled>已结束</button>`;
+  else if (!me.user) cta = html`<a class="btn btn--block" href="#/login">登录后报名</a>`;
+  else if (e.mine === 'registered') cta = html`<button class="btn btn--ghost btn--block" data-act="event-cancel" data-id="${e.id}">取消报名</button>`;
+  else if (e.layer === 0 && me.identity !== 'member_active' && !e.public_signup) cta = html`<button class="btn btn--ghost btn--block" disabled>暂只对会员开放报名</button>`;
+  else if (e.left <= 0) cta = html`<button class="btn btn--ghost btn--block" disabled>名额已满</button>`;
+  else cta = html`<button class="btn btn--primary btn--block" data-act="event-register" data-id="${e.id}">报名${me.identity === 'member_active' ? ' · 会员免费' : ''}</button>`;
   return {
-    tall: true,
-    label: e.title,
-    body: html`<div class="evhead c-${e.color}">
-        <p class="evhead__k">${t.en} · ${t.zh}</p>
-        <h2 class="evhead__t">${e.title}</h2>
-        <p class="evhead__en">${e.en}</p>
-        <p class="evhead__d">${p.mon} ${p.d} · ${p.dowEn} · ${fmt.time(e.startsAt)}</p>
-      </div>
-      ${admitted === 'going' ? html`<div class="admit c-${e.color}"><b>ADMIT ONE</b><span>座位已确认 · SEAT CONFIRMED</span></div>`
-        : admitted === 'waitlist' ? html`<div class="admit admit--wait c-${e.color}"><b>WAITLIST</b><span>已加入候补 · 有空位会通知你</span></div>` : ''}
-      <div class="facts">
-        <div class="fact">${icon('clock')}<div>${fmt.range(e.startsAt, e.endsAt)}<small>${e.membersOnly ? '仅限会员' : '对公众开放 · 会员保留席位'}</small></div></div>
-        <div class="fact">${icon('pin')}<div>${e.venue}<small>Something Ventured · Hangzhou</small></div></div>
-        <div class="fact">${icon('cameo')}<div>主持 · ${e.host || '礼宾台'}${e.speakers && e.speakers.length ? html`<small>嘉宾：${e.speakers.join('、')}</small>` : ''}</div></div>
-      </div>
-      <p class="prose">${e.description}</p>
-      <div class="meter"><div class="meter__l"><span>${e.taken} / ${e.capacity} SEATS</span><span>${e.waitlist ? `WAITLIST ${e.waitlist}` : e.left ? `${e.left} LEFT` : 'FULL'}</span></div>
-        <div class="meter__track"><span class="meter__fill" style="width:${pct}%"></span></div></div>`,
+    label: e.title, tall: true,
+    body: html`<div class="sheet__h"><span>${k.en} · ${k.zh}</span><b>${e.title}</b>${e.en ? html`<span style="text-transform:none;letter-spacing:.04em">${e.en}</span>` : ''}</div>
+      <div class="${term() ? 'panel' : 'ccard'}" style="margin:0">${term() ? html`<span class="panel__t">${e.id}</span>` : html`<div class="ccard__call"><span>${e.id.toUpperCase()}</span><span>${e.layer ? 'MEMBERS' : 'PUBLIC'}</span></div>`}
+        <dl class="kv" style="margin-top:${term() ? 0 : 10}px"><dt>时间</dt><dd>${fmt.range(e.start_at, e.end_at)}</dd><dt>地点</dt><dd>${e.location}</dd><dt>主持</dt><dd>${e.host}${e.guests ? ` · 嘉宾 ${e.guests}` : ''}</dd><dt>名额</dt><dd>${e.taken} / ${e.capacity}${e.left ? '' : ' · 已满'}</dd></dl>
+        <p class="note" style="opacity:.9">${e.intro}</p></div>
+      <p class="note">需要报名以控制人数；名额满后不设候补。${e.layer === 0 && e.public_signup ? '这一场对非会员开放报名。' : ''}</p>`,
     foot: cta,
   };
 }
 
-/* ---------- key ---------- */
-function viewKey(me) {
-  S.ui.me = me;
-  const code = entryCode(me.secret);
-  return html`${bar({ title: '钥匙', sub: 'Your key' })}
-  <main class="main"><div class="keyscreen">
-    <p class="keyscreen__k">Present at the door · 出示入场</p>
-    ${memberCard(me)}
-    <div class="plate" aria-live="polite">
-      <p class="plate__k">Door code · 入场码</p>
-      <span id="code">${flaps(code)}</span>
-      <p class="plate__foot"><svg class="timer" viewBox="0 0 24 24"><circle class="t-bg" cx="12" cy="12" r="9"/><circle class="t-fg" id="ring" cx="12" cy="12" r="9" stroke-dasharray="56.55" stroke-dashoffset="0"/></svg><span id="ttl">30 秒后更新</span></p>
-    </div>
-    <div class="keyctl">
-      <button type="button" data-act="flip">Flip<span>翻面</span></button>
-      ${typeof DeviceOrientationEvent !== 'undefined' && typeof DeviceOrientationEvent.requestPermission === 'function' ? html`<button type="button" data-act="tilt">Tilt<span>倾斜看光泽</span></button>` : ''}
-    </div>
-    <div class="keyfacts">
-      <div><span>No.</span><b>${me.no}</b></div>
-      <div><span>Member since</span><b>${me.since.replaceAll('-', '.')}</b></div>
-      <div><span>Host · 专属服务</span><b>${me.host ? `${me.host.name} ${me.host.en}` : '—'}</b></div>
-      <div><span>Valid at · 通用</span><b class="cityrow">${CITIES.map((c, i) => html`<i class="${i === 0 ? 'is-on' : ''}">${c.id}</i>`)}</b></div>
-    </div>
-    <p class="keynote">调高屏幕亮度，把入场码出示给前台。<br>入场码每 30 秒更新一次，离线也能使用。</p>
-    ${S.offline ? html`<span class="offline">OFFLINE · 离线模式</span>` : ''}
-    ${S.ui.firstKey ? html`<span class="welcome-in" data-stamp>Welcome<small>欢迎入会</small></span>` : ''}
-  </div></main>`;
+/* ---------- booking ---------- */
+async function loadBook() {
+  const win = await call('sessions.window');
+  const open = win.sessions.filter(s => s.status === 'on_sale' && !s.past_cutoff);
+  if (!S.ui.session || !win.sessions.some(s => s.id === S.ui.session)) S.ui.session = (open[0] || win.sessions[0] || {}).id;
+  if (S.params.zone) S.ui.zone = S.params.zone;
+  const map = S.ui.session ? await call('session.map', { session_id: S.ui.session }) : null;
+  return { win, map };
 }
-
-let keyTimer = null;
-function stopKey() { clearInterval(keyTimer); keyTimer = null; detachTilt(); }
-function afterKey() {
-  stopKey();
-  const me = S.ui.me;
-  if (!me) return;
-  if (S.ui.firstKey) { setTimeout(() => { S.ui.firstKey = false; $('[data-stamp]')?.remove(); }, 3200); }
-  if (S.ui.lastVisits != null && me.stats.visits > S.ui.lastVisits) welcomeIn();
-  S.ui.lastVisits = me.stats.visits;
-  let last = entryCode(me.secret);
-  const tick = () => {
-    const now = Date.now();
-    const left = (CODE_STEP - (now % CODE_STEP)) / 1000;
-    const ring = $('#ring');
-    if (!ring) return stopKey();
-    ring.style.strokeDashoffset = String(56.55 * (1 - left / 30));
-    $('#ttl').textContent = `${Math.ceil(left)} 秒后更新`;
-    const code = entryCode(me.secret, now);
-    if (code !== last) {
-      const cells = document.querySelectorAll('#code .fc');
-      [...code].forEach((c, i) => { if (cells[i] && cells[i].textContent !== c) { cells[i].textContent = c; cells[i].classList.remove('is-flip'); void cells[i].offsetWidth; cells[i].classList.add('is-flip'); } });
-      last = code;
-    }
-  };
-  tick();
-  keyTimer = setInterval(tick, 1000);
-  attachTilt();
-}
-function welcomeIn() {
-  const host = $('.keyscreen');
-  if (!host) return;
-  const el = document.createElement('span');
-  el.className = 'welcome-in';
-  el.innerHTML = 'Welcome in<small>欢迎光临</small>';
-  host.appendChild(el);
-  navigator.vibrate?.(40);
-  setTimeout(() => el.remove(), 3600);
-}
-
-/* card tilt: pointer on desktop, gyroscope on phones */
-let tiltOff = null;
-function attachTilt() {
-  const card = $('.keyscreen .mcard');
-  if (!card || reduceMotion()) return;
-  const set = (x, y) => {
-    card.classList.add('is-tilting');
-    card.style.setProperty('--ry', `${x * 14}deg`);
-    card.style.setProperty('--rx', `${-y * 12}deg`);
-    card.style.setProperty('--mx', `${50 + x * 45}%`);
-    card.style.setProperty('--my', `${50 + y * 45}%`);
-  };
-  const move = e => { const r = card.getBoundingClientRect(); set((e.clientX - r.left) / r.width - .5, (e.clientY - r.top) / r.height - .5); };
-  const leave = () => { card.classList.remove('is-tilting'); ['--rx', '--ry'].forEach(p => card.style.setProperty(p, '0deg')); };
-  const orient = e => { if (e.gamma == null) return; set(Math.max(-1, Math.min(1, e.gamma / 35)) / 2, Math.max(-1, Math.min(1, (e.beta - 45) / 35)) / 2); };
-  card.addEventListener('pointermove', move);
-  card.addEventListener('pointerleave', leave);
-  addEventListener('deviceorientation', orient);
-  tiltOff = () => { card.removeEventListener('pointermove', move); card.removeEventListener('pointerleave', leave); removeEventListener('deviceorientation', orient); };
-}
-function detachTilt() { if (tiltOff) tiltOff(); tiltOff = null; }
-
-/* ---------- reserve ---------- */
-async function loadReserve() {
-  const [av, mine] = await Promise.all([get('reserve.availability', { date: S.ui.date }), get('reserve.mine')]);
-  S.ui.date = av.date;
-  return { av, mine };
-}
-
-function viewReserve(d) {
-  const { av, mine } = d;
-  const floorBtn = (id, fl, name, note) => html`<button class="floorbtn" aria-pressed="${String(S.ui.floor === id)}" data-act="floor" data-floor="${id}"><b>${fl}</b><span>${name}</span><small>${note}</small></button>`;
-  const head = html`${bar({ title: '预订', sub: 'Reserve a seat' })}`;
-  const floors = html`<div class="floors">${floorBtn('library', '3F', 'Library', av.floor.status === 'open' ? '营业中' : '开业周可订')}${floorBtn('night', '2F', 'Nightclub', '规划中')}${floorBtn('dining', '1F', 'Dining & Bar', '规划中')}</div>`;
-  if (S.ui.floor !== 'library') {
-    return html`${head}<main class="main">${floors}
-      <div class="planned"><div class="planned__sign"><b>Coming soon</b><span>规划中</span></div>
-      <p>${S.ui.floor === 'night' ? '2F 将是一间夜店。' : '1F 将是餐厅与酒吧。'}<br>同一把钥匙，开业后在这里预订。<br>想第一时间知道？按铃告诉你的专属服务人员。</p>
-      <button class="btn btn--light btn--sm" style="margin-top:18px" data-act="concierge">Ring the desk<span>按铃登记意向</span></button></div>
-      ${myReservations(mine)}</main>`;
-  }
-  const sess = av.sessions.find(s => s.id === S.ui.session) || av.sessions[0];
-  const zone = sess.zones.find(z => z.id === S.ui.zone);
-  const party = S.ui.session === 'day' && zone && zone.unit === 'seat' ? 1 : S.ui.party;
-  const units = zone && zone.unit === 'room' ? 1 : party;
-  return html`${head}<main class="main">${floors}
-    <div class="dates" role="listbox" aria-label="选择日期">${av.range.map(r => html`<button class="date ${r.date === av.date ? 'is-on' : ''}" role="option" aria-selected="${String(r.date === av.date)}" data-act="date" data-date="${r.date}" style="--load:${Math.round(r.load * 100)}%">
-      ${r.date === av.floor.openingDate ? html`<span class="date__tag">开业</span>` : ''}${r.mine ? html`<span class="date__mine"></span>` : ''}
-      <span>${fmt.dowEnOf(r.date)}</span><b>${fmt.dayOf(r.date)}</b><small>${fmt.monthEnOf(r.date)}</small><i></i></button>`)}</div>
-    <div class="switchrow">
-      <button class="switch" type="button" role="switch" aria-checked="${String(S.ui.session === 'night')}" data-act="session" aria-label="切换白天 / 夜晚时段">
-        <span class="switch__lbl switch__lbl--day">Day<em>白天</em></span>
-        <span class="switch__plate" aria-hidden="true"><i class="switch__screw"></i><span class="switch__slot"><span class="switch__lever"></span></span><i class="switch__screw"></i></span>
-        <span class="switch__lbl switch__lbl--night">Night<em>夜晚</em></span>
-      </button>
-      <p class="switchrow__note">${S.ui.session === 'day' ? '白天 10:00–18:00 · 会员时段，仅限本人' : '夜晚 18:00–01:00 · 对外开放，可携友'}</p>
-    </div>
-    <div class="plan">${planSVG(sess.zones, S.ui.zone)}
-      <div class="plan__legend"><span><i class="lg-free"></i>可订</span><span><i class="lg-on"></i>已选</span><span><i class="lg-full"></i>已满</span></div></div>
-    ${sess.mine ? html`<div style="margin:14px 16px 0">${keytag(sess.mine)}<button class="btn btn--ghost btn--block" style="margin-top:10px" data-act="cancel-res" data-id="${sess.mine.id}">Cancel<span>取消这个预订</span></button></div>`
-      : zone ? html`<div class="zonecard">
-        <div class="zonecard__h"><div><b>${zone.zh}</b><i>${zone.en}</i></div><span class="zonecard__left">${zone.left > 0 ? `余 ${zone.left} / ${zone.capacity} ${zone.unit === 'room' ? '间' : '席'}` : '已满'}</span></div>
-        <p class="zonecard__p">${zone.note}</p>
-        <div class="zonecard__row"><div><b>Party · 人数</b>${S.ui.session === 'day' && zone.unit === 'seat' ? html`<p>白天为会员时段，仅限本人</p>` : zone.unit === 'room' ? html`<p>按间预订，最多 4 人</p>` : ''}</div>
-          <span class="stepper"><button type="button" data-act="party" data-d="-1" aria-label="减少" ${raw(party <= 1 || (S.ui.session === 'day' && zone.unit === 'seat') ? 'disabled' : '')}>${icon('minus')}</button><output>${party}</output><button type="button" data-act="party" data-d="1" aria-label="增加" ${raw(party >= 4 || (S.ui.session === 'day' && zone.unit === 'seat') || (zone.unit === 'seat' && party >= zone.left) ? 'disabled' : '')}>${icon('plus')}</button></span></div>
-        <label class="field" style="border-bottom:1px solid var(--rule)"><span class="field__l"><b>Note</b><span>备注 <i>选填</i></span></span><input class="input" data-bind="note" maxlength="120" placeholder="例：靠窗的位置" value="${S.ui.note}"></label>
-        <button class="btn btn--accent btn--block" data-act="book" ${raw(zone.left < units ? 'disabled' : '')}>Hold my seat<span>${fmt.mdOf(av.date)} ${fmt.dowOf(av.date)} · ${S.ui.session === 'day' ? '白天' : '夜晚'} · 确认预订</span></button>
-      </div>` : html`<p class="empty" style="margin:14px 16px 0"><b>Pick a spot.</b>点选平面图上的区域。</p>`}
-    ${myReservations(mine)}
+function viewBook(d) {
+  const { win, map } = d;
+  const sel = S.ui.zone;
+  const z = sel && map ? map.zones.find(x => x.id === sel) : null;
+  const zz = sel ? zoneOf(sel) : null;
+  const prev = S.ui.prev[S.ui.session] || {};
+  const cracked = map ? ['B05', 'B06'].filter(c => prev[c] === 'reserved_sealed' && map.states[c].state !== 'reserved_sealed') : [];
+  if (map) S.ui.prev[S.ui.session] = Object.fromEntries(Object.entries(map.states).map(([c, v]) => [c, v.state]));
+  const layout = term() ? S.ui.layout : 'night';
+  const plan = !map ? '' : term()
+    ? raw(planASCII({ states: map.states, selected: sel || '', layout }))
+    : raw(planSVG({ states: map.states, selected: sel || '', initials: S.me.user ? S.me.user.initials : '', cracked }));
+  const dates = html`<div class="dates">${win.sessions.map(s => html`<button class="date" aria-pressed="${String(s.id === S.ui.session)}" data-act="date" data-id="${s.id}" ${raw(s.status !== 'on_sale' || s.past_cutoff ? 'disabled' : '')}><span>${fmt.dowEnOf(s.date)}</span><b>${fmt.dayOf(s.date)}</b><small>${s.past_cutoff ? '现场' : fmt.monthEnOf(s.date)}</small></button>`)}</div>`;
+  const s = map && map.session;
+  return html`${header(term() ? 'floor-plan' : '预订', '按区域订座 · Book by zone')}<main class="main">
+    ${dates}
+    <p class="session-line">${win.member ? '会员可订 7 天' : '非会员可订 3 天'} · ${s ? html`<b>${s.title}</b> · ${s.performers} · ${s.show_start} 开场` : ''}</p>
+    ${term() ? html`<div class="layout-toggle"><button class="chip" aria-pressed="${String(layout === 'night')}" data-act="layout" data-v="night">NIGHT 夜间布局</button><button class="chip" aria-pressed="${String(layout === 'day')}" data-act="layout" data-v="day">DAY 日间布局</button></div>` : ''}
+    <div class="mapwrap" id="map">${plan}</div>
+    <p class="mapwrap__note">${layout === 'day' ? '日间布局（会员时间）：座谈、阅读与会议。会议请在首页申请。' : '点选一个区域。门店确认时安排具体桌号。'}${!term() && map && map.zones.some(x => x.sealed) ? ' 带火漆的是会员预留卡座，19:00 开放。' : ''}</p>
+    ${z && layout === 'night' ? zoneCard(z, zz, map) : ''}
+    <section class="section"><div class="sh"><b>${layout === 'day' ? '日间分区' : '全部区域'}</b><span>List view</span></div>
+      <div class="zlist">${(map ? map.zones : []).map(x => { const q = zoneOf(x.id); const dz = DAY_ZONES[x.id]; return html`<button class="zrow" aria-pressed="${String(sel === x.id)}" data-act="zone" data-id="${x.id}"><span><b>${layout === 'day' ? dz.zh : q.zh}<i>${layout === 'day' ? dz.en : q.en}</i></b><small>${layout === 'day' ? dz.blurb : q.tags.join(' · ')}</small></span><em>${layout === 'day' ? '' : zoneAvail(x)}</em></button>`; })}</div></section>
+    <p class="motto">${term() ? 'press and hold the far corner. something is there.' : '一张桌，一个年份，一段首轮故事。'}</p>
   </main>`;
 }
-function myReservations(mine) {
-  const up = mine.filter(r => !r.past);
-  return html`<section class="section" style="margin-top:28px"><div class="sechead"><div class="sechead__t"><b>我的预订</b><span>My reservations</span></div></div>
-    <div class="stack">${up.length ? up.map(r => keytag(r)) : html`<div class="empty">还没有预订。</div>`}</div></section>`;
+function zoneCard(z, zz, map) {
+  const member = map.member_on_date;
+  const booth = z.kind === 'booth';
+  const p = z.price || {};
+  const cta = !S.me.user ? html`<a class="btn btn--block" href="#/login">登录后预订</a>`
+    : z.free ? html`<button class="btn btn--primary btn--block" data-act="book-zone" data-id="${z.id}">选这个区域 · ${booth ? '提交后门店确认' : member ? '即时成功' : '购票'}</button>`
+    : html`<button class="btn btn--ghost btn--block" disabled>${z.sealed ? '会员预留 · 19:00 后空着的开放' : '这一晚已满'}</button>`;
+  const inner = html`<p class="${term() ? 'out' : 'ccard__t'}">${zz.zh} · ${zz.en}</p>
+    <p class="note" style="opacity:.85">${zz.blurb}</p>
+    <div class="zcard__tags">${zz.tags.map(t => html`<span>${t}</span>`)}</div>
+    ${booth ? html`<div class="cmp"><div class="${member ? 'is-me' : ''}"><b>${yuan(p.min_member)}</b><span>会员低消 · 订金 ${yuan(p.deposit_member)}</span></div><div class="${member ? '' : 'is-me'}"><b>${yuan(p.min_guest)}</b><span>非会员低消 · 订金 ${yuan(p.deposit_guest)}</span></div></div>
+      <p class="note">每桌 ${z.capacity} 人，余 ${z.free} / ${z.total} 张。订金是该身份低消的 30%，抵当晚消费；卡座由门店 30 分钟内人工确认。${z.reserved ? '这两张每晚为会员预留，19:00 后空着的向所有人开放。' : ''}</p>`
+    : html`<div class="cmp"><div class="${member ? 'is-me' : ''}"><b>免票</b><span>会员 · 无需预付，需点酒</span></div><div class="${member ? '' : 'is-me'}"><b>${yuan(map.ticket_price)}</b><span>非会员门票 / 人 · 含${map.ticket_drink}</span></div></div>
+      <p class="note">按座位预订，余 ${z.free} / ${z.total} 座。${member ? '会员本人到场，同行免票。' : '门票每人每场最多 4 张，购票人本人到场，最多带 3 位同行人。'}</p>`}
+    <div style="margin-top:14px">${cta}</div>`;
+  return html`<section class="zcard">${term() ? html`<div class="panel" style="margin:0"><span class="panel__t" data-scramble>${zz.en.toUpperCase()}</span><span class="panel__r">${z.free}/${z.total}</span>${inner}</div>` : html`<div class="ccard"><div class="ccard__call"><span>§ ${ZONES.findIndex(x => x.id === zz.id) + 1} · ${zz.en.toUpperCase()}</span><span>${zoneAvail(z)}</span></div>${inner}</div>`}</section>`;
+}
+function afterBook() {
+  const pre = $('.aplan');
+  if (!pre) return;
+  let timer = null;
+  pre.addEventListener('pointerdown', e => {
+    const r = pre.getBoundingClientRect();
+    if ((e.clientX - r.left) / r.width < 0.3 && (e.clientY - r.top) / r.height < 0.05) timer = setTimeout(() => trigger('hidden-room'), 1200);
+  });
+  ['pointerup', 'pointerleave', 'pointercancel'].forEach(t => pre.addEventListener(t, () => clearTimeout(timer)));
+  pre.addEventListener('click', e => { const el = e.target.closest('[data-zone]'); if (el && S.ui.layout === 'night') selectZone(el.dataset.zone); });
+}
+function selectZone(id) {
+  S.ui.zone = id;
+  render();
+  requestAnimationFrame(() => $('.zcard')?.scrollIntoView({ behavior: reduceMotion() ? 'auto' : 'smooth', block: 'nearest' }));
+}
+
+function sheetBooking() {
+  const map = S.data.book && S.data.book.map;
+  const z = map.zones.find(x => x.id === S.ui.zone);
+  const zz = zoneOf(S.ui.zone);
+  const q = S.ui.quote;
+  const err = S.ui.quoteErr;
+  const booth = z.kind === 'booth';
+  const member = map.member_on_date;
+  const need = q ? q.required : Math.ceil(S.ui.party / z.capacity);
+  const units = q ? q.units : need + S.ui.extra;
+  const due = q ? q.price.total_due : 0;
+  const rules = booth ? ['订金为该身份低消的 30%，抵当晚消费。', `付款后进入门店确认，${map.confirm_minutes} 分钟内未确认或被拒绝，全额原路退回。`, `${map.session.hold_deadline} 留位截止；之后门店可以释放桌位，订金当晚仍可抵扣。`, '当晚未到店，订金不退。会员本人须到场。']
+    : member ? ['会员散台、拼桌与吧台无需预付，需点酒入座。', '会员本人到场，同行朋友免票。']
+    : [`门票 ${yuan(map.ticket_price)} / 人，含${map.ticket_drink}，赠饮视为满足点酒入座。`, '每人每场最多 4 张，购票人本人到场，最多带 3 位同行人，整单核验。', '门票不可转赠，售出后不支持主动退款；演出取消全额退款。'];
+  return {
+    label: '预订', tall: true,
+    body: html`<div class="sheet__h"><span>${fmt.mdOf(map.session.date)} ${fmt.dowOf(map.session.date)} · ${map.session.title}</span><b>${zz.zh} · ${zz.en}</b></div>
+      <div class="row2"><div><b>人数</b><small>${booth ? `每桌 ${z.capacity} 人，需要 ${need} 张` : member ? '按座位预订' : '门票 = 人数'}</small></div>
+        <span class="stepper"><button type="button" data-act="party" data-d="-1" aria-label="减少" ${raw(S.ui.party <= 1 ? 'disabled' : '')}>${icon('minus')}</button><output>${S.ui.party}</output><button type="button" data-act="party" data-d="1" aria-label="增加">${icon('plus')}</button></span></div>
+      ${booth ? html`<div class="row2"><div><b>多要一张桌</b><small>超出所需桌数需写说明，门店人工确认</small></div><span class="stepper"><button type="button" data-act="extra" data-d="-1" ${raw(S.ui.extra <= 0 ? 'disabled' : '')}>${icon('minus')}</button><output>${S.ui.extra}</output><button type="button" data-act="extra" data-d="1" ${raw(units >= 3 ? 'disabled' : '')}>${icon('plus')}</button></span></div>` : ''}
+      ${booth && (S.ui.extra > 0 || (q && q.manual_reasons.includes('extra_reserved'))) ? html`<label class="field"><span class="field__l">说明 <i>必填</i></span><input class="input" data-bind="explanation" maxlength="120" value="${S.ui.explanation}" placeholder="例：晚一点还有人来"></label>` : ''}
+      <label class="field"><span class="field__l">位置偏好 / 特殊需求 <i>选填 · 填写后转人工确认</i></span><input class="input" data-bind="note" maxlength="120" value="${S.ui.note}" placeholder="例：靠舞台一侧"></label>
+      <div class="sum">
+        ${err ? html`<div class="note note--warn">${err}</div>` : ''}
+        ${q ? html`${q.warnings.map(w => html`<div class="note note--warn">${w.text}</div>`)}
+          <div><span>${booth ? `${units} 张卡座 × 订金 ${yuan(q.price.deposit_each)}` : member ? `${q.seats} 个座位` : `${q.price.tickets} 张门票 × ${yuan(q.price.ticket_price)}`}</span><b>${yuan(due)}</b></div>
+          <div><span>确认方式</span><b>${q.confirm_mode === 'instant' ? '即时成功' : `门店 ${map.confirm_minutes} 分钟内确认`}</b></div>
+          <div class="total"><span>现在需付</span><b>${yuan(due)}</b></div>` : html`<div class="dim">计算中…</div>`}
+      </div>
+      <ul class="rules">${rules.map(r => html`<li>${r}</li>`)}</ul>`,
+    foot: html`<button class="btn btn--primary btn--block" data-act="book-submit" ${raw(!q || err ? 'disabled' : '')}>${due ? `提交并支付 ${yuan(due)}` : '提交预订'}</button>`,
+  };
+}
+const requote = debounce(async () => {
+  if (!S.sheet || S.sheet.type !== 'booking') return;
+  const map = S.data.book.map;
+  try {
+    S.ui.quote = await call('booking.quote', { session_id: map.session.id, zone: S.ui.zone, party_size: S.ui.party, extra: S.ui.extra, note: S.ui.note, explanation: S.ui.explanation });
+    S.ui.quoteErr = null;
+  } catch (e) { S.ui.quote = null; S.ui.quoteErr = e.message + (e.rule ? `（${e.rule}）` : ''); }
+  renderSheet();
+}, 220);
+
+function sheetPay({ booking: b }) {
+  return {
+    label: '支付',
+    body: html`<div class="paysheet"><p class="paysheet__k">${b.price.tickets ? 'TICKETS · 门票' : 'DEPOSIT · 订金'}</p><p class="paysheet__amt">${yuan(b.price.total_due)}</p>
+      <p class="note">${zoneOf(b.zone).zh} · ${fmt.mdOf(b.date)} · ${b.party_size} 人 · ${b.code}</p>
+      <p class="paysheet__mock">模拟支付 · payment.provider = mock<br>商户号到位后换成微信支付</p>
+      <div class="count"><svg class="ring" viewBox="0 0 70 70"><circle class="r-bg" cx="35" cy="35" r="30"/><circle class="r-fg" cx="35" cy="35" r="30" stroke-dasharray="188.5" data-ring="${b.lock_expires_at}" data-span="${10 * 60e3}"/></svg><div><b data-countdown="${b.lock_expires_at}">10:00</b><small>内完成支付，否则自动取消、释放桌位</small></div></div></div>`,
+    foot: html`<div class="btns btns--2"><button class="btn btn--ghost" data-act="pay-cancel" data-id="${b.id}">取消订单</button><button class="btn btn--primary" data-act="pay" data-id="${b.id}">确认支付</button></div>`,
+  };
+}
+
+/* ---------- order (P05, P06, P12) ---------- */
+function orderCard(b) {
+  return html`<a class="slip" href="#/order/${b.id}" style="display:block;text-decoration:none;margin:0 0 12px">
+    <div class="slip__h"><span>${b.code}</span><span>${fmt.mdOf(b.date)} ${fmt.dowOf(b.date)}</span></div>
+    <p class="slip__sub" style="margin-top:10px">${zoneOf(b.zone).zh} · ${b.party_size} 人 · ${b.label.zh}</p>
+    <span class="stamp ${b.status === 'confirmed' ? 'stamp--green' : b.status === 'pending_confirm' ? '' : 'stamp--purple'}">${b.label.deal}<small>${b.label.zh}</small></span></a>`;
+}
+function viewOrder(b) {
+  const z = zoneOf(b.zone);
+  const deadline = b.status === 'pending_payment' ? b.lock_expires_at : b.status === 'pending_confirm' ? b.confirm_deadline_at : null;
+  const refund = b.refund ? (b.refund.status === 'succeeded' ? `已原路退回 ${yuan(b.refund.amount)}` : `退款处理中 · ${yuan(b.refund.amount)}`) : '';
+  const tables = b.lines.length ? b.lines.map(l => `${l.code}${l.name ? `「${l.name}」` : ''}${b.kind === 'seats' ? ` × ${l.seats}` : ''}`).join('、') : '门店确认时安排';
+  const rows = [
+    ['场次', `${fmt.mdOf(b.date)} ${fmt.dowOf(b.date)} · ${b.session.title} · ${b.session.show_start}`],
+    ['区域', `${z.zh} · ${z.en}`], ['人数', `${b.party_size} 人${b.units > 1 ? ` · ${b.units} 张桌` : ''}`], ['桌号', tables],
+    ['金额', b.price.total_due ? `${yuan(b.price.total_due)}${b.price.tickets ? ` · 门票 × ${b.price.tickets}` : ' · 订金'}` : '无需预付'],
+    b.payment ? ['支付', { unpaid: '未支付', paying: '支付中', paid: '已支付', failed_closed: '已关闭' }[b.payment.status]] : null,
+    refund ? ['退款', refund] : null,
+    b.deposit ? ['订金', { unused: '未使用，抵当晚消费', partially_used: `已抵扣 ${yuan(b.deposit.redeemed)}`, used: '已抵扣', valid_tonight_table_released: '桌位已释放，订金当晚仍可抵扣', expired: '已失效（未到店）' }[b.deposit.state]] : null,
+    b.ticket ? ['门票', `${b.ticket.count} 张 · ${b.ticket.verification === 'verified' ? '已核验' : '整单核验'} · 赠饮${b.ticket.drink_redeemed ? '已兑换' : '未兑换'}`] : null,
+    b.note ? ['备注', b.note] : null,
+  ].filter(Boolean);
+  const countdown = deadline ? html`<div class="count"><svg class="ring" viewBox="0 0 70 70"><circle class="r-bg" cx="35" cy="35" r="30"/><circle class="r-fg" cx="35" cy="35" r="30" stroke-dasharray="188.5" data-ring="${deadline}" data-span="${(b.status === 'pending_payment' ? 10 : 30) * 60e3}"/></svg><div><b data-countdown="${deadline}">--:--</b><small>${b.status === 'pending_payment' ? '内完成支付' : '门店确认截止，超时自动关闭并全额退款'}</small></div></div>` : '';
+  const actions = [];
+  if (b.status === 'pending_payment') actions.push(html`<button class="btn btn--primary btn--block" data-act="pay-open" data-id="${b.id}">去支付</button>`);
+  if (b.status === 'rejected' || b.status === 'confirm_timeout_closed') actions.push(html`<button class="btn btn--block" data-act="rebook" data-id="${b.id}">${b.suggestion_zone ? `一键改订 · ${zoneOf(b.suggestion_zone).zh}` : '重新预订'}</button>`);
+  const pass = b.status === 'confirmed' || b.status === 'fulfilled';
+  if (term()) {
+    return html`${header('order', '', { back: 'me' })}<main class="main">
+      <section class="panel"><span class="panel__t" data-scramble>ORDER ${b.code}</span><span class="panel__r">${b.status}</span>
+        <p class="out"><b>${b.label.deal}</b> · ${b.label.zh}${b.label.note ? ` · ${b.label.note}` : ''}</p>
+        ${countdown}
+        <dl class="kv" style="margin-top:12px">${rows.map(([k, v]) => html`<dt>${k}</dt><dd>${v}</dd>`)}</dl>
+        ${b.reject_reason ? html`<p class="out" style="margin-top:12px">store: ${b.reject_reason}${b.suggestion ? `\nsuggest: ${b.suggestion}` : ''}</p>` : ''}
+      </section>
+      ${pass ? html`<section class="panel"><span class="panel__t">ENTRY PASS</span><p class="mcode__d" style="text-align:center;margin-top:8px">${b.code}</p><p class="mcode__t" style="text-align:center;margin-top:8px">出示给前台核验 · 会员另需出示会员卡</p></section>` : ''}
+      <div class="section">${actions}</div>
+      <section class="panel"><span class="panel__t">LOG</span><p class="out">${b.history.map(h => `${fmt.full(h.at)}  ${h.status}${h.note ? ' · ' + h.note : ''}`).join('\n')}</p></section>
+    </main>`;
+  }
+  return html`${header('订单', 'Circulation slip', { back: 'me' })}<main class="main">
+    <article class="slip">
+      <div class="slip__h"><span>LIBRARY LIVE · 借阅单</span><span>${b.rules_version || 'v0.3'}</span></div>
+      <p class="slip__code">${b.code}</p><p class="slip__sub">${b.label.zh}${b.label.note ? ` · ${b.label.note}` : ''}</p>
+      <span class="stamp is-new ${b.status === 'confirmed' || b.status === 'fulfilled' ? 'stamp--green' : b.status === 'pending_confirm' || b.status === 'pending_payment' ? '' : 'stamp--purple'}">${b.label.deal}<small>${b.label.zh}</small></span>
+      ${countdown}
+      <div class="slip__rows">${rows.map(([k, v]) => html`<div><span>${k}</span><b>${v}</b></div>`)}</div>
+      ${b.reject_reason ? html`<p class="note" style="opacity:1">门店：${b.reject_reason}${b.suggestion ? html`<br>建议：${b.suggestion}` : ''}</p>` : ''}
+      ${pass ? html`<p class="note" style="opacity:.9">入场凭证：到店出示这张借阅单的编号 <b class="mono">${b.code}</b>，前台核验。</p>` : ''}
+    </article>
+    <div class="section btns">${actions}</div>
+  </main>`;
 }
 
 /* ---------- me ---------- */
 async function loadMe() {
-  const [me, visits, books, referrals, requests] = await Promise.all([get('me'), get('visits.mine'), get('books.list'), get('referral.mine'), get('concierge.mine')]);
-  return { me, visits, books: books.filter(b => b.mine), referrals, requests };
+  if (!S.me || !S.me.user) return {};
+  const [orders, meetings] = await Promise.all([call('bookings.mine'), S.me.identity === 'member_active' ? call('meetings.mine') : Promise.resolve([])]);
+  return { orders, meetings };
 }
-
+function demoPanel() {
+  const personas = [['member', '会员 林知远'], ['non_member', '非会员'], ['applicant', '审核中'], ['need_info', '待补资料'], ['approved', '待付款'], ['invitee', '受邀人'], ['expired', '已到期']];
+  const clocks = [['real', '现在'], ['14:00', '14:00 白天'], ['18:58', '18:58'], ['19:02', '19:02 入夜'], ['21:40', '21:40'], ['23:10', '23:10'], ['+10', '+10 分'], ['+31', '+31 分']];
+  return html`<div class="demo"><p class="demo__k">Demo · 演示身份</p><div class="chips">${personas.map(([k, l]) => html`<button class="chip" data-act="persona" data-v="${k}">${l}</button>`)}</div>
+    <p class="demo__k">Demo · 演示时钟（全站同步）</p><div class="chips">${clocks.map(([k, l]) => html`<button class="chip" data-act="clock" data-v="${k}">${l}</button>`)}</div></div>`;
+}
 function viewMe(d) {
-  const { me } = d;
-  const theme = store.get('sv.theme') || 'auto';
-  const stamps = d.visits.slice(0, 6);
-  return html`${bar({ title: '我的', sub: 'Dossier' })}
-  <main class="main">
-    <div class="profile">
-      <span class="cameo cameo--lg cameo--pink">${initialOf(me.name)}</span>
-      ${me.en ? html`<p class="profile__name">${me.en}</p><p class="profile__zh">${me.name}</p>` : html`<p class="profile__name" style="font:600 24px/1.3 var(--sans);letter-spacing:.2em">${me.name}</p>`}
-      <p class="profile__meta">NO. ${me.no} · ${sectorOf(me.sector).en.toUpperCase()} · ${me.base} · SINCE ${me.since.slice(0, 7).replace('-', '.')}</p>
-      <p class="profile__v">${me.venture}</p>
-    </div>
-    <div class="tiles">
-      <div class="tile"><b>${me.stats.visits}</b><span>到访</span><small>Visits</small></div>
-      <div class="tile"><b>${me.stats.events}</b><span>节目</span><small>Evenings</small></div>
-      <div class="tile"><b>${me.stats.referrals}</b><span>推荐</span><small>Referrals</small></div>
-    </div>
-
-    <section class="section" style="margin-top:26px">
-      <div class="sechead"><div class="sechead__t"><b>到访护照</b><span>Passport</span></div></div>
-      <div class="passport">${stamps.map((v, i) => html`<div class="pstamp" style="--r:${[-6, 5, -3, 7, -8, 3][i % 6]}deg"><span>${v.place.split(' · ')[0]}</span><b>${fmt.md(v.at)}</b><small>${v.event ? v.event.title : fmt.dow(v.at)}</small></div>`)}
-        ${Array.from({ length: Math.max(0, 6 - stamps.length) }, () => html`<div class="pstamp pstamp--empty"><span>Hangzhou</span><b>· ·</b><small>下一次</small></div>`)}</div>
-    </section>
-
-    <section class="section" style="margin-top:26px">
-      <div class="sechead"><div class="sechead__t"><b>借书卡</b><span>Library card</span></div><a class="link" href="#/stacks">藏书目录 ${icon('arrow')}</a></div>
-      <div class="libcard"><div class="libcard__h"><span>SV · 3F Library</span><span>NO. ${me.no}</span></div>
-        ${d.books.length ? d.books.map(b => html`<div class="libcard__row"><b>${b.title}</b><em class="${b.status === 'loan' ? 'is-loan' : ''}">${b.status === 'loan' ? `DUE ${fmt.md(b.dueAt)}` : 'ON HOLD'}</em></div>`)
-          : html`<div class="libcard__empty">No books yet. 还没有借书。</div>`}</div>
-    </section>
-
-    <section class="section" style="margin-top:26px">
-      <div class="sechead"><div class="sechead__t"><b>我的推荐</b><span>Referrals</span></div><button class="link" data-act="nominate">推荐一位 ${icon('plus')}</button></div>
-      <div class="list">${d.referrals.length ? d.referrals.map(a => html`<div class="row"><span class="cameo" style="width:34px;height:42px;font-size:15px;box-shadow:none">${initialOf(a.name)}</span><span class="row__t"><b>${a.name}</b><span>${a.venture} · ${fmt.rel(a.createdAt)}</span></span><span class="pill pill--${a.stage}">${stageLabel(a.stage)}</span></div>`)
-        : html`<div class="empty" style="border-top:0">Something Ventured 仅限推荐。<br>你可以推荐一位「懂的都懂」的同类。</div>`}</div>
-    </section>
-
-    <section class="section" style="margin-top:26px">
-      <div class="sechead"><div class="sechead__t"><b>礼宾记录</b><span>The desk</span></div><button class="link" data-act="concierge">按铃 ${icon('bell')}</button></div>
-      <div>${d.requests.length ? d.requests.slice(0, 3).map(r => reqRow(r)) : html`<div class="empty">有任何需要，按铃找 ${me.host ? me.host.name : '礼宾台'}。</div>`}</div>
-    </section>
-
-    <section class="section" style="margin-top:26px">
-      <div class="sechead"><div class="sechead__t"><b>设置</b><span>Settings</span></div></div>
-      <div class="seg" role="group" aria-label="外观">
-        <button aria-pressed="${String(theme === 'auto')}" data-act="theme" data-v="auto">${icon('auto')}跟随系统</button>
-        <button aria-pressed="${String(theme === 'light')}" data-act="theme" data-v="light">${icon('sun')}白天</button>
-        <button aria-pressed="${String(theme === 'dark')}" data-act="theme" data-v="dark">${icon('moon')}夜晚</button>
-      </div>
-      <div class="list" style="margin-top:14px">
-        <button class="row" data-act="install"><span class="row__i">${icon('addbox')}</span><span class="row__t"><b>添加到主屏幕</b><span>${isStandalone() ? '已在主屏幕上' : '像 App 一样打开，离线也能出示钥匙'}</span></span><span class="row__r">${icon('arrow')}</span></button>
-        <button class="row" data-act="about"><span class="row__i">${icon('crest')}</span><span class="row__t"><b>关于这个演示</b><span>${getMode() === 'server' ? '已连接演示服务器 · 数据实时同步' : '本地演示模式 · 数据保存在本机'}</span></span><span class="row__r">${icon('arrow')}</span></button>
-        <button class="row" data-act="logout"><span class="row__i">${icon('close')}</span><span class="row__t"><b>退出登录</b><span>${me.phone}</span></span><span class="row__r"></span></button>
-      </div>
-    </section>
-    <p class="motto">Nothing ventured, nothing gained.</p>
+  const me = S.me;
+  if (!me.user) {
+    return html`${masthead()}<main class="main">
+      <section class="section"><div class="ccard"><div class="ccard__call"><span>READER’S CARD · 借书证</span><span>No. ————</span></div><p class="ccard__t">还没有登录</p><p class="ccard__p">用手机号登录后可以订座、购票、报名活动；会员通过邀请或申请审核入会。</p></div>
+        <div class="btns" style="margin-top:14px"><a class="btn btn--block" href="#/login">登录</a><a class="btn btn--ghost btn--block" href="#/invite/SV-WELCOME">我有邀请</a></div></section>
+      ${demoPanel()}</main>`;
+  }
+  return term() ? meTerminal(d) : meLibrary(d);
+}
+function meLibrary(d) {
+  const me = S.me;
+  const a = me.application;
+  const ms = me.membership;
+  let status;
+  if (me.identity === 'applicant' && a.status === 'approved_awaiting_payment') {
+    status = html`<div class="ccard"><div class="ccard__call"><span>APPLICATION</span><span>${a.label.en}</span></div><p class="ccard__t">审核通过</p>
+      <p class="ccard__p">支付首月会员费 ${yuan(me.member_price)} 后会员立即生效，按自然月计算，之后每月主动续费，不自动扣款。会员费开通后的退款规则尚待确认。</p><span class="stamp stamp--green stamp--abs">Approved<small>已通过</small></span></div>
+      <button class="btn btn--primary btn--block" style="margin-top:12px" data-act="app-pay">支付 ${yuan(me.member_price)}（模拟）</button>`;
+  } else if (me.identity === 'applicant') {
+    status = html`<div class="ccard"><div class="ccard__call"><span>APPLICATION</span><span>${a.label.en}</span></div><p class="ccard__t">${a.label.zh}</p>
+      <p class="ccard__p">${a.status === 'need_info' ? (a.review_note || '门店需要你补充资料。') : '门店会尽快审核。审核期间可按非会员规则订座、购票。'}</p>
+      ${a.history.map(h => html`<p class="ccard__p mono" style="font-size:11.5px">${fmt.full(h.at)} · ${APP_STATUS[h.status].zh}</p>`)}
+      <span class="stamp stamp--abs">${a.status === 'need_info' ? 'Need info' : 'In review'}<small>${a.status === 'need_info' ? '待补充' : '尽调中'}</small></span></div>
+      ${a.status === 'need_info' ? html`<a class="btn btn--block" style="margin-top:12px" href="#/apply">补充资料</a>` : ''}`;
+  } else if (me.identity === 'invitee') {
+    status = html`<a class="btn btn--primary btn--block" href="#/invite/${me.invite.token}">打开邀请函 · 领取 ${me.invite.months} 个月会员</a>`;
+  } else if (me.identity === 'member_expired') {
+    status = html`<div class="ccard"><div class="ccard__call"><span>MEMBERSHIP · No.${me.user.member_no}</span><span>EXPIRED</span></div><p class="ccard__t">会员已于 ${fmt.date(ms.end_at)} 到期</p>
+      <p class="ccard__p">${ms.can_renew ? `到期 30 天内续费，不需重新审核；续费后恢复会员界面与已解锁内容。` : '到期超过 30 天，需要重新申请。'}</p><span class="stamp stamp--purple stamp--abs">Expired<small>已到期</small></span></div>
+      ${ms.can_renew ? html`<button class="btn btn--primary btn--block" style="margin-top:12px" data-act="renew">续费 ${yuan(me.member_price)} / 月（模拟）</button>` : html`<a class="btn btn--block" style="margin-top:12px" href="#/apply">重新申请</a>`}`;
+  } else {
+    status = html`<div class="btns"><a class="btn btn--block" href="#/apply">申请入会</a><a class="btn btn--ghost btn--block" href="#/invite/SV-WELCOME">我有邀请</a></div><p class="note">会员需要审核；推荐只作为来源记录。</p>`;
+  }
+  return html`${header('我的', 'Reader’s card')}<main class="main">
+    <section class="section"><div class="ccard"><div class="ccard__call"><span>READER’S CARD · 借书证</span><span>${me.user.member_no ? `No.${me.user.member_no}` : 'No. ————'}</span></div>
+      <p class="ccard__t">${me.user.name || '新读者'}</p><p class="ccard__p">${me.user.phone} · ${IDENTITIES[me.identity].zh}</p></div></section>
+    <section class="section">${status}</section>
+    <section class="section"><div class="sh"><b>我的预订</b><span>Slips</span></div>${d.orders && d.orders.length ? d.orders.map(orderCard) : html`<p class="empty">还没有预订。</p>`}</section>
+    <section class="section"><button class="btn btn--ghost btn--block" data-act="logout">退出登录</button></section>
+    ${demoPanel()}
+    <p class="motto">图书馆的另一面，在入会之后。</p>
   </main>`;
 }
-const stageLabel = s => ({ received: '已收到', diligence: '尽调中', initiation: '入会仪式', welcomed: '已入会', declined: '未通过' }[s] || s);
-function reqRow(r) {
-  const t = REQUEST_TYPES[r.type] || REQUEST_TYPES.other;
-  return html`<div class="reqrow"><div class="reqrow__h"><b>${t.zh}</b><span class="pill pill--${r.status}">${r.status === 'open' ? '处理中' : r.status === 'replied' ? '已回复' : '已完成'}</span></div>
-    <p>${r.text}</p><small>${fmt.rel(r.createdAt)}</small>
-    ${r.reply ? html`<div class="reply"><b>${r.by ? r.by.name : '礼宾台'} · Reply</b>${r.reply}</div>` : ''}</div>`;
-}
-
-/* ---------- stacks ---------- */
-function viewStacks(books) {
-  const q = S.ui.q.trim().toLowerCase();
-  const shown = books.filter(b => !q || b.title.toLowerCase().includes(q) || b.author.toLowerCase().includes(q));
-  const shelves = [...new Set(shown.map(b => b.shelf[0]))].sort();
-  const names = { A: '风险与创业', B: '机器与心智', C: '硅谷往事', D: '方法与人' };
-  const short = b => {
-    const chars = [...b.title];
-    const max = b.lang === 'en' ? 18 : 9;
-    return chars.length > max ? chars.slice(0, max - 1).join('') + '…' : b.title;
-  };
-  return html`${bar({ title: '藏书', sub: 'The Stacks', back: 'me' })}
-  <main class="main">
-    <div class="titlecard" style="padding-bottom:4px"><p class="kicker">3F Library · Hangzhou</p><h1 class="h1">真实的藏书</h1><p class="lede">Not a decorative wall. 开业前可预留，开业后到 3F 取书。</p></div>
-    <label class="search">${icon('book')}<input type="search" placeholder="书名或作者" data-bind="q" data-live="stacks" value="${S.ui.q}" aria-label="搜索藏书"></label>
-    ${shelves.length ? shelves.map(letter => {
-      const row = shown.filter(b => b.shelf[0] === letter);
-      return html`<div class="shelf"><p class="shelf__k"><span>Shelf ${letter} · ${names[letter] || ''}</span><span>${row.length} 册</span></p>
-        <div class="shelf__row">${row.map(b => {
-          const h = 118 + (hashN(b.id) % 44);
-          const w = b.lang === 'en' ? 30 + (hashN(b.title) % 8) : 32 + (hashN(b.title) % 10);
-          return html`<button class="spine sp-${b.color} ${b.lang === 'en' ? 'spine--en' : ''} ${b.status !== 'shelf' && !b.mine ? 'is-out' : ''} ${b.mine ? 'is-mine' : ''}" style="--h:${h}px;--w:${w}px" data-act="spine" data-id="${b.id}" aria-label="${b.title}，${b.author}${b.mine ? '，已为你预留' : b.status !== 'shelf' ? '，已被借出或预留' : ''}">${b.mine ? html`<span class="spine__flag"></span>` : ''}${short(b)}</button>`;
-        })}</div><div class="shelf__board"></div></div>`;
-    }) : html`<p class="empty" style="margin:20px">没有找到。</p>`}
-    <p class="motto">每位会员最多同时预留或借阅 3 本。</p>
+function meTerminal(d) {
+  const me = S.me;
+  const ms = me.membership;
+  const ph = store.get('sv.phosphor') || 'amber';
+  const paper = store.get('sv.paper') || 'green';
+  return html`${header('dossier')}<main class="main">
+    <section class="section" style="margin-top:18px">
+      <div class="pcard" data-act="flip" role="button" tabindex="0" aria-label="会员卡，点按翻面">
+        <div class="pcard__flip">
+          <div class="pcard__face"><span class="pcard__brand">STH.VENTURED · LIBRARY LIVE</span><span class="pcard__no">NO.${me.user.member_no}</span>${raw(punchCard(`SV-${me.user.member_no}-${(me.user.en || me.user.name).replace(/\s/g, '').toUpperCase()}`))}</div>
+          <div class="pcard__face pcard__back"><small>THIS CARD OPENS EVERY DOOR OF STH.VENTURED</small><button class="pcard__ink" data-act="ink" type="button">THE BEST WAY TO PREDICT THE FUTURE IS TO INVENT IT.</button><small>valid until ${fmt.date(ms.end_at)}</small></div>
+        </div>
+      </div>
+      <div class="mcode"><span class="mcode__d" data-mcode>------</span><span class="mcode__t">MEMBER CODE · 每 30 秒更新 · 给前台核验本人到场</span></div>
+    </section>
+    <section class="panel"><span class="panel__t" data-scramble>MEMBERSHIP</span><span class="panel__r">${ms.source}</span>
+      <dl class="kv"><dt>no.</dt><dd>${me.user.member_no}</dd><dt>name</dt><dd>${me.user.name} ${me.user.en || ''}</dd><dt>valid</dt><dd>${fmt.date(ms.since)} → ${fmt.date(ms.end_at)}${ms.expiring_soon ? html` <span class="tag tag--warn">${ms.days_left}d left</span>` : ` · ${ms.days_left} 天`}</dd><dt>source</dt><dd>${ms.source === 'gift' ? '赠送（邀请领取）' : '付费'}</dd><dt>unlocked</dt><dd>${me.unlocked.length ? me.unlocked.join(' · ') : '—'}</dd></dl>
+      <button class="btn btn--sm" style="margin-top:12px" data-act="renew">RENEW · 续费 ${yuan(me.member_price)}</button></section>
+    <section class="panel"><span class="panel__t">ORDERS</span>${d.orders && d.orders.length ? html`<div class="ls">${d.orders.slice(0, 8).map(b => html`<a class="ls__r" href="#/order/${b.id}"><span class="ls__m">${fmt.mdOf(b.date)}</span><span class="ls__t">${zoneOf(b.zone).zh} · ${b.party_size} 人<small>${b.code} · ${b.label.zh}</small></span><span class="ls__a">${b.label.deal}</span></a>`)}</div>` : html`<p class="out">no orders yet.</p>`}</section>
+    <section class="panel"><span class="panel__t">MEETINGS</span>${d.meetings && d.meetings.length ? html`<div class="ls">${d.meetings.slice(0, 6).map(meetingRow)}</div>` : html`<p class="out">none.</p>`}<button class="btn btn--sm" style="margin-top:10px" data-act="meeting-new">NEW REQUEST</button></section>
+    <section class="panel"><span class="panel__t">DISPLAY</span><span class="panel__r">members only</span>
+      <p class="out">phosphor (night)</p><div class="chips">${[['amber', 'P3 AMBER'], ['green', 'P1 GREEN'], ['ice', 'P4 ICE']].map(([v, l]) => html`<button class="chip" aria-pressed="${String(ph === v)}" data-act="phosphor" data-v="${v}">${l}</button>`)}</div>
+      <p class="out" style="margin-top:8px">paper (day)</p><div class="chips">${[['green', 'GREEN-BAR'], ['blue', 'BLUE-BAR'], ['plain', 'PLAIN']].map(([v, l]) => html`<button class="chip" aria-pressed="${String(paper === v)}" data-act="paper" data-v="${v}">${l}</button>`)}</div></section>
+    <section class="section"><button class="btn btn--ghost btn--block" data-act="logout">LOGOUT</button></section>
+    ${demoPanel()}
+    <p class="motto">tap the banner on the home screen five times.</p>
   </main>`;
 }
-const hashN = s => [...String(s)].reduce((h, c) => (h * 31 + c.charCodeAt(0)) >>> 0, 7);
-
-function sheetBook({ id }) {
-  const b = (S.data.stacks || []).find(x => x.id === id);
-  if (!b) return { body: html`<p class="empty">找不到这本书。</p>` };
-  const st = b.mine ? (b.status === 'loan' ? ['On loan', '借阅中'] : ['On hold', '已预留']) : b.status === 'shelf' ? null : ['Out', '已借出'];
-  return {
-    label: b.title,
-    body: html`<div class="sheet__head"><p class="kicker">Catalogue card · 索书卡</p></div>
-      <div class="catcard">
-        <div class="catcard__h"><span>SV-3F · ${b.shelf}</span><span>${b.lang === 'en' ? 'EN' : '中文'}</span></div>
-        <p class="catcard__t">${b.title}</p><p class="catcard__a">${b.author}</p>
-        <div class="catcard__lines"><div><span>Shelf · 书架</span><b>${b.shelf}</b></div><div><span>Status · 状态</span><b>${b.status === 'shelf' ? '在架' : b.mine ? (b.status === 'loan' ? '你借阅中' : '为你预留') : '暂不可借'}</b></div><div><span>Pick up · 取书</span><b>3F 前台</b></div></div>
-        ${st ? html`<span class="catcard__stamp">${st[0]}<small>${st[1]}</small></span>` : ''}
-      </div>
-      <div style="margin-top:22px">${b.mine && b.status === 'held' ? html`<button class="btn btn--ghost btn--block" data-act="release" data-id="${b.id}">Release<span>取消预留</span></button>`
-        : b.status === 'shelf' ? html`<button class="btn btn--accent btn--block" data-act="hold" data-id="${b.id}">Hold this book<span>预留 · 到店取书</span></button>`
-        : b.mine ? html`<p class="muted" style="text-align:center">借阅中，请按时归还。</p>` : html`<p class="muted" style="text-align:center">这本书暂时不在架上。</p>`}</div>`,
-  };
+let codeTimer = null;
+function afterMe() {
+  clearInterval(codeTimer);
+  const el = $('[data-mcode]');
+  if (!el || !S.me.secret) return;
+  const tick = () => { if (!el.isConnected) return clearInterval(codeTimer); el.textContent = memberCode(S.me.secret, serverNow()); };
+  tick();
+  codeTimer = setInterval(tick, 1000);
 }
 
-/* ---------- other sheets ---------- */
+/* ---------- content pages (P14) ---------- */
+function viewContent(c) {
+  if (c.locked) {
+    const hint = c.rule ? RULE_HINT[c.rule] : '会员可见';
+    if (term()) return html`${header(c.key, '', { back: 'home' })}<main class="main"><section class="panel"><span class="panel__t">LOCKED</span><p class="out">${c.teaser.title}\n\nPermission denied (layer ${c.layer}).\n${hint}</p></section></main>`;
+    return html`${header('会员馆藏', 'Restricted', { back: 'home' })}<main class="main"><section class="section" style="margin-top:18px">${teaserCard(c)}
+      <p class="note">会员内容只露出标题与一句话；正文在入会之后可见。</p>
+      ${S.me.user ? html`<a class="btn btn--block" style="margin-top:14px" href="#/me">申请入会</a>` : html`<a class="btn btn--block" style="margin-top:14px" href="#/login">登录</a>`}</section></main>`;
+  }
+  const b = c.body;
+  let body;
+  if (c.key === 'memo') body = html`<pre class="fig fig--sm" style="margin:0 0 8px">${FIG.brand.join('\n')}</pre><p class="out" data-type>THE MEMO · ${b.issue}\n\n本周到访\n${b.visits.map(([n, t]) => `  * ${n}：${t}`).join('\n')}\n\n下周\n  ${b.next}\n\n书单\n${b.books.map(x => `  - ${x}`).join('\n')}\n\n${b.line}</p>`;
+  else if (c.key === 'afterhours') body = html`<p class="out">AFTER HOURS · 只在入夜后出现\n</p><div class="ls">${b.drinks.map(([n, t]) => html`<div class="ls__r"><span class="ls__m">${n}</span><span class="ls__t">${t}</span><span></span></div>`)}</div><p class="out" style="margin-top:10px">${b.note}</p>`;
+  else if (c.key === 'shelf') body = html`<p class="out">MY SHELF · 借过的书连成你的书单\n${b.mine.length ? b.mine.map(x => `  ${x.date}  ${x.title} — ${x.author}`).join('\n') : '  (empty)'}\n</p>
+    <p class="out">${b.checked_in_today ? (b.borrowed_today ? '今天已经借过一本。' : '今天签到了，可以借一本：') : '今天还没签到。白天签到后可以借一本。'}</p>
+    ${b.checked_in_today && !b.borrowed_today ? html`<div class="ls">${b.books.map(x => html`<button class="ls__r" data-act="borrow" data-id="${x.id}"><span class="ls__m">${x.id.toUpperCase()}</span><span class="ls__t">${x.title}<small>${x.author}</small></span><span class="ls__a">[BORROW]</span></button>`)}</div>` : ''}`;
+  else if (c.key === 'recordings') body = html`<p class="out">RECORDINGS · 只给到过现场的人</p><div class="ls">${b.items.map(x => html`<div class="ls__r"><span class="ls__m">${x.date}</span><span class="ls__t">${x.title}<small>host ${x.host} · ${x.minutes} min</small></span><span class="ls__a" title="录音文件由运营上传">[&gt; PLAY]</span></div>`)}</div><p class="out dim" style="margin-top:8px">录音文件由运营上传后可播放。</p>`;
+  else if (c.key === 'speakers') body = html`<p class="out">SPEAKERS · 讲者名录</p><div class="ls">${b.names.map(x => html`<div class="ls__r"><span class="ls__m">#${x.no}</span><span class="ls__t">${x.name} ${x.en}<small>${x.talks.join(' · ')}</small></span><span></span></div>`)}</div>`;
+  else if (c.key === 'hidden-room') body = html`<pre class="out" style="white-space:pre">${[
+    '   +--------------------------+',
+    '   |  .--.                    |',
+    '   | (    )   1957            |',
+    '   |  `--\'    ______          |',
+    '   |         |      |  []     |',
+    '   |  []     |______|         |',
+    '   |                    o     |',
+    '   +-----------[    ]---------+',
+  ].join('\n')}</pre><p class="out">${b.lines.join('\n')}</p>`;
+  else body = html`<p class="out" data-type>${(b.lines || []).join('\n\n')}</p>`;
+  return html`${header(c.key, '', { back: 'home' })}<main class="main"><section class="panel"><span class="panel__t" data-scramble>${c.teaser.title.split(' · ').pop().toUpperCase()}</span><span class="panel__r">L${c.layer}</span>${body}</section>
+    <p class="motto">${c.layer >= 2 ? 'you found this by doing something, not by paying for it.' : 'members only.'}</p></main>`;
+}
+function afterContent() { $$('[data-type]', screenEl).forEach(el => typewrite(el)); }
+
+/* ---------- login, apply, invite ---------- */
+function viewLogin() {
+  return html`${header('登录', 'The front desk', { back: 'home' })}<main class="main main--plain">
+    <section class="section" style="margin-top:20px"><form class="ccard" data-form="login" novalidate style="padding-bottom:28px">
+      <div class="ccard__call"><span>SIGN IN · 登录</span><span>LIBRARY LIVE</span></div>
+      <label class="field" style="margin-top:12px"><span class="field__l">手机号</span><input class="input mono" name="phone" inputmode="numeric" autocomplete="tel" placeholder="138 0000 0007" maxlength="13"></label>
+      <label class="field"><span class="field__l">验证码 <i>演示：${DEMO_CODE}</i></span><input class="input mono" name="code" inputmode="numeric" maxlength="4" placeholder="····" value=""></label>
+      <p class="err" data-err></p>
+      <button class="btn btn--block">登录</button>
+      <p class="note">第一次登录会创建账号（非会员）。会员需要邀请或申请审核。</p>
+    </form></section>
+    ${demoPanel()}
+  </main>`;
+}
+function viewApply() {
+  const me = S.me;
+  const p = (me.application && me.application.profile) || {};
+  return html`${header('申请入会', 'Application', { back: 'me' })}<main class="main main--plain">
+    <section class="section" style="margin-top:18px"><form class="ccard" data-form="apply" novalidate style="padding-bottom:28px">
+      <div class="ccard__call"><span>APPLICATION · 入会申请</span><span>${me.application && me.application.status === 'need_info' ? 'NEED INFO' : 'NEW'}</span></div>
+      ${me.application && me.application.review_note ? html`<p class="ccard__p" style="color:#A3353A">门店：${me.application.review_note}</p>` : ''}
+      <label class="field" style="margin-top:10px"><span class="field__l">姓名 / 称呼 <i>*</i></span><input class="input" name="name" maxlength="30" value="${p.name || me.user.name || ''}"></label>
+      <label class="field"><span class="field__l">手机号 <i>*</i></span><input class="input mono" name="phone" inputmode="numeric" maxlength="13" value="${(p.phone || '').replace(/^(\d{3})(\d{4})(\d{4})$/, '$1 $2 $3')}" placeholder="${me.user.phone}"></label>
+      <label class="field"><span class="field__l">所在城市 <i>*</i></span><input class="input" name="city" maxlength="20" value="${p.city || me.user.city || '杭州'}"></label>
+      <label class="field"><span class="field__l">公司 / 项目与角色 <i>*</i></span><input class="input" name="company_role" maxlength="60" value="${p.company_role || me.user.company_role || ''}" placeholder="例：远望机器人 · 创始人"></label>
+      <label class="field"><span class="field__l">简短自我介绍</span><textarea class="ta" name="intro" maxlength="300">${p.intro || ''}</textarea></label>
+      <label class="field"><span class="field__l">推荐来源 <i>选填 · 只作记录</i></span><input class="input" name="referrer" maxlength="30" value="${p.referrer || ''}"></label>
+      <p class="err" data-err></p>
+      <button class="btn btn--block">${me.application && me.application.status === 'need_info' ? '提交补充资料' : '提交申请'}</button>
+      <p class="note">审核通过后支付首月 ${yuan(me.member_price)}，会员立即生效；之后按月主动续费。</p>
+    </form></section></main>`;
+}
+function viewInvite(inv) {
+  const me = S.me;
+  let cta;
+  if (inv.status === 'claimed') cta = inv.mine ? html`<a class="btn btn--block" href="#/home">已领取 · 进入会员层</a>` : html`<button class="btn btn--ghost btn--block" disabled>这张邀请已被领取</button>`;
+  else if (inv.status === 'expired') cta = html`<button class="btn btn--ghost btn--block" disabled>已过领取期</button>`;
+  else if (inv.status === 'disabled') cta = html`<button class="btn btn--ghost btn--block" disabled>这张邀请已停用</button>`;
+  else if (!me.user) cta = html`<a class="btn btn--block" href="#/login?next=invite/${inv.token}">登录后领取</a>`;
+  else if (me.identity === 'member_active') cta = html`<a class="btn btn--ghost btn--block" href="#/home">你已经是会员</a>`;
+  else if (!inv.for_me) cta = html`<button class="btn btn--ghost btn--block" disabled>这张邀请是给另一位朋友的</button>`;
+  else cta = html`<button class="btn btn--stamp btn--block" data-act="claim" data-id="${inv.token}">拆开 · 领取 ${inv.months} 个月会员</button>`;
+  return html`${header('邀请函', 'An invitation', { back: 'home' })}<main class="main main--plain">
+    <div class="envelope"><svg class="envelope__seal"><use href="#i-seal"/></svg><p class="envelope__k">sth.ventured · invitation</p>
+      <p class="envelope__t">${inv.note}</p><p class="envelope__p">赠送 ${inv.months} 个自然月会员，领取当天开始。<br>最晚领取日 ${fmt.date(inv.deadline)}。邀请码 <span class="mono">${inv.token}</span></p></div>
+    <section class="section">${cta}<p class="note">领取后与付费会员权益相同；到期后 ${yuan(S.me.member_price)} / 月，主动续费，不自动扣款。</p></section>
+  </main>`;
+}
+
+/* ---------- sheets ---------- */
 function sheetNotices({ items }) {
-  const kindIcon = { bulletin: 'crest', rsvp: 'ticket', reservation: 'lamp', request: 'bell', referral: 'cameo', visit: 'key', book: 'book', welcome: 'crest', host: 'cameo', stage: 'crest' };
-  return {
-    tall: true,
-    label: '来信与通知',
-    body: html`<div class="sheet__head"><p class="kicker">Letters · 来信</p><h2 class="h2">礼宾台与你</h2></div>
-      ${items ? (items.length ? items.map(n => html`<div class="notice notice--${n.kind} ${n.read ? '' : 'is-unread'}"><span class="notice__i">${icon(kindIcon[n.kind] || 'bell')}</span><div><div class="notice__t"><b>${n.title}</b><small>${fmt.rel(n.at)}</small></div>${n.body ? html`<p>${n.body}</p>` : ''}</div></div>`) : html`<p class="empty">暂时没有来信。</p>`)
-        : html`<p class="empty">…</p>`}`,
-  };
+  return { label: '通知', tall: true, body: html`<div class="sheet__h"><span>Notices · 通知</span><b>${term() ? '/var/mail' : '来信'}</b></div>
+    ${items ? (items.length ? html`<div class="ls">${items.map(n => html`<div class="ls__r"><span class="ls__m">${fmt.rel(n.at, serverNow())}</span><span class="ls__t">${n.read ? '' : '● '}${n.title}<small>${n.body}</small></span><span></span></div>`)}</div>` : html`<p class="empty">暂时没有通知。</p>`) : html`<p class="empty">…</p>`}` };
 }
-
-function sheetConcierge({ sent, requests }) {
-  const me = S.data.lobby?.me || S.data.me?.me || S.ui.me;
-  return {
-    tall: true,
-    label: '按铃',
-    body: html`<div class="sheet__head">
-        <svg class="deskbell ${sent ? 'is-ring' : ''}" viewBox="0 0 92 70" aria-hidden="true"><circle cx="46" cy="9" r="5" fill="currentColor"/><rect x="43" y="12" width="6" height="8" fill="currentColor"/><path d="M12 54a34 34 0 0 1 68 0z" fill="currentColor"/><path d="M24 46a24 26 0 0 1 16-22" stroke="rgba(255,255,255,.55)" stroke-width="3" fill="none" stroke-linecap="round"/><rect x="4" y="56" width="84" height="8" rx="4" fill="#5A3F38"/></svg>
-        <p class="kicker">Ring for service · 按铃</p><h2 class="h2">你的专属服务人员会回复你</h2>${me && me.host ? html`<p class="muted" style="font-size:13px">${me.host.name} ${me.host.en} · ${me.host.role}</p>` : ''}</div>
-      <form data-form="concierge">
-        <div class="chips" style="justify-content:center">${Object.entries(REQUEST_TYPES).map(([k, t]) => html`<button type="button" class="chip" aria-pressed="${String(S.ui.reqType === k)}" data-act="reqtype" data-v="${k}">${t.zh}</button>`)}</div>
-        <label class="field" style="margin-top:8px"><span class="field__l"><b>Message</b><span>想要什么帮助？</span></span><textarea class="textarea" name="text" maxlength="300" placeholder="例：周五晚上想带一位朋友来听不插电。" data-bind="reqText">${S.ui.reqText || ''}</textarea></label>
-        <p class="form-err" data-err></p>
-        <button class="btn btn--accent btn--block btn--row">${icon('bell')}Ring<span>按铃</span></button>
-      </form>
-      ${requests && requests.length ? html`<div style="margin-top:24px"><p class="kicker kicker--muted" style="text-align:center;margin-bottom:6px">Earlier · 之前的请求</p>${requests.slice(0, 5).map(reqRow)}</div>` : ''}`,
-  };
-}
-
-function sheetNominate({ result }) {
-  if (result) {
-    const link = new URL(`./#/apply?invite=${result.invite}`, location.href).href;
-    return {
-      label: '推荐函',
-      body: html`<div class="sheet__head"><p class="kicker">Sealed · 推荐函已封缄</p><h2 class="h2">把邀请码交给对方</h2><p class="muted" style="font-size:13px">致 ${result.application.name}</p></div>
-        <div class="envelope"><svg class="envelope__seal"><use href="#i-seal"/></svg>
-          <p class="envelope__k">Invitation code · 邀请码</p><p class="envelope__code">${result.invite}</p>
-          <p class="envelope__p">对方打开会员端，选择「申请推荐入会」并填入邀请码，<br>筛选进展会同步给你。</p></div>
-        <div class="btns" style="margin-top:20px">
-          <button class="btn btn--accent btn--row" data-act="copy-invite" data-text="${S.data.me?.me?.name || ''} 邀请你申请加入 Something Ventured。打开 ${link} ，邀请码 ${result.invite}">${icon('copy')}Copy<span>复制邀请</span></button>
-          <button class="btn btn--ghost" data-act="sheet-close">Done<span>完成</span></button>
-        </div>`,
-    };
+function sheetCheckin({ status, result, code, companions }) {
+  if (!status) return { body: html`<p class="empty">…</p>` };
+  if (S.me.identity !== 'member_active') return { label: '签到', body: html`<div class="sheet__h"><b>签到是会员功能</b></div><p class="note">白天为会员时间，非会员白天不开放。</p>` };
+  if (status.mode !== 'day') return { label: '签到', body: html`<div class="sheet__h"><span>CHECK-IN</span><b>现在不是日间时段</b></div><p class="out" style="text-align:center">签到码只在白天（10:00–19:00）有效。</p>` };
+  const done = result || (status.checked_in ? { at: status.at, companions: status.companions, repeat: true } : null);
+  if (done) {
+    const p = fmt.parts(done.at);
+    return { label: '签到成功', body: html`<div class="sheet__h"><span>${done.repeat && !result ? 'ALREADY IN' : 'CHECKED IN'}</span><b>${done.repeat && !result ? '今天已经签过了' : '欢迎回来'}</b></div>
+      <div style="text-align:center"><pre class="dstamp">${`LIBRARY LIVE\n\n ${p.d} ${p.mon} ${p.y}\n\n  IN ${fmt.time(done.at)}\n  +${done.companions} GUESTS`}</pre></div>
+      <p class="out" style="margin-top:14px;text-align:center">${status.status}</p>
+      ${result && result.unlocked && result.unlocked.includes('shelf') ? html`<a class="btn btn--primary btn--block" style="margin-top:16px" href="#/content/shelf">UNLOCKED · 借阅书单</a>` : ''}` };
   }
   return {
-    tall: true,
-    label: '推荐一位同类',
-    body: html`<div class="sheet__head"><p class="kicker">By referral only · 仅限推荐</p><h2 class="h2">推荐一位同类</h2><p class="lede" style="font-size:14px">If you know, you know.</p></div>
-      <form data-form="nominate" novalidate>
-        <label class="field"><span class="field__l"><b>Name</b><span>姓名 <i>*</i></span></span><input class="input" name="name" maxlength="30"></label>
-        <label class="field"><span class="field__l"><b>Mobile</b><span>手机号 <i>*</i></span></span><input class="input input--mono" name="phone" inputmode="numeric" maxlength="13"></label>
-        <label class="field"><span class="field__l"><b>Venture & role</b><span>公司 / 职位</span></span><input class="input" name="venture" maxlength="60"></label>
-        <div class="field"><span class="field__l"><b>Sector</b><span>领域</span></span>${choiceGroup('sector', SECTORS.map(s => [s.id, s.zh]), 'AI')}</div>
-        <label class="field"><span class="field__l"><b>Why</b><span>一句话推荐理由 <i>选填</i></span></span><textarea class="textarea" name="note" maxlength="300"></textarea></label>
-        <p class="form-err" data-err></p>
-        <button class="btn btn--accent btn--block">Seal the letter<span>生成推荐函</span></button>
+    label: '签到',
+    body: html`<div class="sheet__h"><span>CHECK-IN · ${status.date}</span><b>扫门口今天的签到码</b></div>
+      <div style="text-align:center"><pre class="dstamp" aria-label="今天的签到图案">${stampText(stampPattern(status.demo_code))}</pre></div>
+      <p class="note" style="text-align:center">签到码每天一换，像图书馆的日戳。真实小程序里直接扫码；这里输入图案下方的 4 位码。</p>
+      <label class="field"><span class="field__l">签到码 <i>演示：${status.demo_code}</i></span><input class="input" data-bind="ciCode" maxlength="4" value="${code || ''}" style="text-transform:uppercase;letter-spacing:.3em"></label>
+      <div class="row2"><div><b>同行人数</b><small>朋友不用注册、不用签到</small></div><span class="stepper"><button type="button" data-act="ci-comp" data-d="-1" ${raw((companions || 0) <= 0 ? 'disabled' : '')}>${icon('minus')}</button><output>${companions || 0}</output><button type="button" data-act="ci-comp" data-d="1">${icon('plus')}</button></span></div>`,
+    foot: html`<div class="btns btns--2"><button class="btn btn--ghost" data-act="ci-fill">读取门口的码</button><button class="btn btn--primary" data-act="ci-submit">签到</button></div>`,
+  };
+}
+function sheetMeeting({ v }) {
+  v = v || {};
+  const days = Array.from({ length: 8 }, (_, i) => new Date(serverNow() + i * 864e5 + 8 * 36e5).toISOString().slice(0, 10));
+  const times = []; for (let h = 10; h <= 19; h++) for (const m of ['00', '30']) if (!(h === 19 && m === '30')) times.push(`${pad(h)}:${m}`);
+  const opt = (list, cur) => list.map(t => `<option value="${t}"${t === cur ? ' selected' : ''}>${t}</option>`).join('');
+  return {
+    label: '会议申请', tall: true,
+    body: html`<div class="sheet__h"><span>MEETING REQUEST · 零支付</span><b>多人会议，提前申请</b></div>
+      <form data-form="meeting" novalidate>
+        <label class="field"><span class="field__l">日期</span><select class="sel" name="date">${raw(days.map(d => `<option value="${d}"${d === v.date ? ' selected' : ''}>${d} ${fmt.dowOf(d)}</option>`).join(''))}</select></label>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px"><label class="field"><span class="field__l">开始</span><select class="sel" name="start">${raw(opt(times, v.start || '14:00'))}</select></label><label class="field"><span class="field__l">结束 <i>≤ 19:00</i></span><select class="sel" name="end">${raw(opt(times, v.end || '16:00'))}</select></label></div>
+        <label class="field"><span class="field__l">人数</span><input class="input" name="party_size" type="number" min="2" max="30" value="${v.party_size || 6}"></label>
+        <label class="field"><span class="field__l">需求</span><input class="input" name="needs" maxlength="200" placeholder="例：需要投影和白板" value="${v.needs || ''}"></label>
+        <p class="err" data-err></p>
+        <button class="btn btn--primary btn--block">提交申请</button>
+        <p class="note">门店会接受、拒绝或提议调整；调整需要你确认。会议不能跨过 19:00。</p>
       </form>`,
   };
 }
-
-let deferredInstall = null;
-addEventListener('beforeinstallprompt', e => { e.preventDefault(); deferredInstall = e; });
-function sheetInstall() {
-  const ua = navigator.userAgent;
-  const wechat = /MicroMessenger/i.test(ua);
-  const ios = /iP(hone|ad|od)/.test(ua) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
-  const android = /Android/i.test(ua);
-  let steps;
-  if (isStandalone()) steps = html`<p class="empty"><b>Already home.</b>钥匙已经在你的主屏幕上了。</p>`;
-  else if (wechat) steps = html`<svg class="wechat-arrow" viewBox="0 0 70 70" aria-hidden="true"><path d="M8 62C22 40 34 26 58 12" stroke="currentColor" stroke-width="3" fill="none" stroke-linecap="round" stroke-dasharray="2 7"/><path d="M46 10l13 1-4 12" stroke="currentColor" stroke-width="3" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>
-      <div class="steps"><div class="step"><div><b>点右上角 ${icon('dots')}</b><span>微信里不能直接添加到桌面</span></div></div>
-      <div class="step"><div><b>选择「在浏览器打开」</b><span>iPhone 会用 Safari 打开</span></div></div>
-      <div class="step"><div><b>再点一次「添加到主屏幕」</b><span>在浏览器里打开这一页，按提示操作</span></div></div></div>`;
-  else if (ios) steps = html`<div class="steps"><div class="step"><div><b>点 Safari 底部的 ${icon('share')} 分享</b><span>如果看不到工具栏，先轻点屏幕底部</span></div></div>
-      <div class="step"><div><b>选择「添加到主屏幕」${icon('addbox')}</b><span>可能需要往下滑一点</span></div></div>
-      <div class="step"><div><b>点右上角「添加」</b><span>桌面会出现 Ventured 的图标</span></div></div></div>`;
-  else if (deferredInstall) steps = html`<button class="btn btn--accent btn--block btn--row" data-act="install-prompt">${icon('addbox')}Install<span>安装到桌面</span></button>`;
-  else if (android) steps = html`<div class="steps"><div class="step"><div><b>点浏览器的菜单 ${icon('dots')}</b><span>通常在右上角或右下角</span></div></div>
-      <div class="step"><div><b>选择「添加到桌面」或「添加至主屏幕」</b><span>华为、小米等浏览器名称略有不同</span></div></div></div>`;
-  else steps = html`<div class="steps"><div class="step"><div><b>用手机打开这个地址</b><span class="mono" style="word-break:break-all">${location.href.split('#')[0]}</span></div></div>
-      <div class="step"><div><b>再从浏览器菜单「添加到主屏幕」</b><span>iPhone 用 Safari，安卓用系统浏览器或 Chrome</span></div></div></div>`;
-  return {
-    label: '添加到主屏幕',
-    body: html`<div class="sheet__head"><p class="kicker">Add to Home Screen · 添加到主屏幕</p><h2 class="h2">一枚放在口袋里的钥匙</h2><p class="lede" style="font-size:14px">No app store. No review queue.</p></div>${steps}
-      <p class="muted" style="font-size:12px;text-align:center;margin-top:18px">添加后从桌面打开：全屏显示，入场码离线可用。</p>`,
-  };
-}
-
-function sheetAbout() {
-  const mode = getMode();
-  return {
-    label: '关于这个演示',
-    body: html`<div class="sheet__head"><svg style="width:46px;height:46px;color:var(--accent-fg)"><use href="#i-crest"/></svg><p class="kicker">About this demo · 演示说明</p><h2 class="h2">Something Ventured 会员端</h2></div>
-      <div class="facts">
-        <div class="fact">${icon('crest')}<div>${mode === 'server' ? '已连接演示服务器' : mode === 'offline' ? '离线：显示的是缓存内容' : '本地演示模式'}<small>${mode === 'server' ? '会员端与管理后台的数据实时同步。' : '没有服务器时，数据保存在这台设备的浏览器里；同一浏览器打开管理后台，也能看到同一份数据。'}</small></div></div>
-        <div class="fact">${icon('key')}<div>演示会员 林知远 · 138 0000 0007<small>演示申请人 宋予安 · 139 0000 0021 · 验证码 ${DEMO_CODE}</small></div></div>
-        <div class="fact">${icon('lobby')}<div><a href="../admin/" style="color:var(--accent-fg)">打开管理后台 →</a><small>后台 PIN 1215，可以审核申请、核验入场码、发布节目与公告。</small></div></div>
-      </div>
-      ${mode === 'local' ? html`<button class="btn btn--ghost btn--block" style="margin-top:20px" data-act="reset-local">Reset demo data<span>重置本机演示数据</span></button>` : ''}`,
-  };
-}
-
-function sheetBooked({ r }) {
-  return {
-    label: '预订成功',
-    body: html`<div class="sheet__head"><p class="kicker">Your seat is held · 预订成功</p><h2 class="h2">座位已为你保留</h2><p class="muted" style="font-size:13px">${r.zone.zh} · ${r.sessionInfo.zh}</p></div>
-      <div class="admit c-mint" style="width:260px"><b>${r.floor.floor} · ${fmt.mdOf(r.date)}</b><span>${r.code}</span></div>
-      <div class="facts" style="margin-top:22px">
-        <div class="fact">${icon('clock')}<div>${fmt.mdOf(r.date)} ${fmt.dowOf(r.date)} · ${r.sessionInfo.hours}<small>${r.sessionInfo.en}</small></div></div>
-        <div class="fact">${icon('seat')}<div>${r.zone.zh} ${r.zone.en} · ${r.party} 位<small>到店出示钥匙页的入场码即可</small></div></div>
-      </div>
-      <button class="btn btn--accent btn--block" style="margin-top:22px" data-act="sheet-close">Splendid<span>好的</span></button>`,
-  };
-}
-
-const SHEETS = { event: sheetEvent, book: sheetBook, notices: sheetNotices, concierge: sheetConcierge, nominate: sheetNominate, install: sheetInstall, about: sheetAbout, booked: sheetBooked };
-
+const SHEETS = { event: sheetEvent, booking: sheetBooking, pay: sheetPay, notices: sheetNotices, checkin: sheetCheckin, meeting: sheetMeeting };
 function openSheet(type, props = {}) {
   S.sheet = { type, ...props };
   renderSheet();
@@ -938,277 +723,183 @@ function openSheet(type, props = {}) {
 }
 function renderSheet() {
   if (!S.sheet) return;
-  const prev = $('.sheet__body', sheetEl);
+  const prev = $('.sheet__b', sheetEl);
   const keep = prev ? prev.scrollTop : 0;
+  const focusKey = document.activeElement && document.activeElement.dataset && document.activeElement.dataset.bind;
   const v = SHEETS[S.sheet.type](S.sheet);
-  sheetEl.innerHTML = html`<div class="scrim" data-act="sheet-close"></div>
-    <section class="sheet ${v.tall ? 'sheet--tall' : ''}" role="dialog" aria-modal="true" aria-label="${v.label || ''}">
-      <div class="sheet__grab"></div>
-      <button class="iconbtn sheet__close" data-act="sheet-close" aria-label="关闭">${icon('close')}</button>
-      <div class="sheet__body">${v.body}</div>
-      ${v.foot ? html`<div class="sheet__foot">${v.foot}</div>` : ''}
-    </section>`.s;
-  const body = $('.sheet__body', sheetEl);
-  if (body) body.scrollTop = keep;
+  sheetEl.innerHTML = html`<div class="scrim" data-act="sheet-close"></div><section class="sheet ${v.tall ? 'sheet--tall' : ''}" role="dialog" aria-modal="true" aria-label="${v.label || ''}">
+    <div class="sheet__grab"></div><button class="ibtn sheet__x" data-act="sheet-close" aria-label="关闭">${icon('close')}</button>
+    <div class="sheet__b">${v.body}</div>${v.foot ? html`<div class="sheet__f">${v.foot}</div>` : ''}</section>`.s;
+  const b = $('.sheet__b', sheetEl);
+  if (b) b.scrollTop = keep;
+  if (focusKey) { const el = $(`[data-bind="${focusKey}"]`, sheetEl); if (el) { el.focus(); const n = el.value.length; try { el.setSelectionRange(n, n); } catch { /* number inputs */ } } }
 }
 function closeSheet() {
   sheetEl.classList.remove('is-open');
-  const closing = S.sheet;
   S.sheet = null;
-  setTimeout(() => { if (!S.sheet && closing) sheetEl.innerHTML = ''; }, 450);
+  setTimeout(() => { if (!S.sheet) sheetEl.innerHTML = ''; }, 420);
+}
+
+/* ---------- overlays: the unlock, the donut ---------- */
+function playUnlock() {
+  if (overlayEl.dataset.played) return;
+  overlayEl.dataset.played = '1';
+  overlayEl.hidden = false;
+  overlayEl.className = 'overlay';
+  const me = S.me;
+  overlayEl.innerHTML = html`<div class="overlay__in"><pre id="dec"></pre><p class="overlay__l">LAYER 1 · MEMBER #${me.user.member_no}<br>欢迎来到图书馆的机器层</p></div><button class="overlay__skip" data-act="unlock-skip">SKIP ›</button>`.s;
+  const lines = [...FIG.access, '', ...FIG.granted];
+  const done = () => {
+    call('unlock.seen').catch(() => {});
+    setTimeout(() => { overlayEl.hidden = true; overlayEl.innerHTML = ''; }, 500);
+  };
+  S.unlockFinish = decrypt($('#dec'), lines, { duration: 2400, onDone: done });
+}
+let stopDonut = null;
+function showDonut() {
+  overlayEl.hidden = false;
+  overlayEl.className = 'overlay overlay--donut';
+  overlayEl.innerHTML = html`<div class="overlay__in"><pre id="donut"></pre><p class="overlay__l">donut.c · Andy Sloane, 2006<br>tap anywhere to close</p></div>`.s;
+  stopDonut = donut($('#donut'));
+  overlayEl.onclick = () => { stopDonut && stopDonut(); overlayEl.hidden = true; overlayEl.innerHTML = ''; overlayEl.onclick = null; };
+}
+async function trigger(key) {
+  try {
+    const r = await call('egg.trigger', { key });
+    navigator.vibrate?.(30);
+    toast(r.fresh ? `解锁 · ${r.title}` : r.title);
+    if (key === 'hidden-room') go('content/hidden-room');
+    return r;
+  } catch (e) { toast(e.message, 'error'); return null; }
 }
 
 /* ---------- actions ---------- */
-async function busy(el, fn) {
-  if (el) el.classList.add('is-busy');
-  try { return await fn(); } finally { if (el) el.classList.remove('is-busy'); }
-}
+async function busy(el, fn) { el?.classList.add('is-busy'); try { return await fn(); } finally { el?.classList.remove('is-busy'); } }
 function handleError(e, errEl) {
-  if (e && (e.code === 'auth' || (e.code === 'forbidden' && S.role === 'member'))) {
-    signOut(true);
-    toast('请重新登录', 'error');
-    return true;
-  }
-  if (e && e.code === 'forbidden' && S.role !== 'applicant') { S.role = 'applicant'; go('status'); return true; }
-  if (errEl) errEl.textContent = e.message || '出了点问题';
-  else toast((e && e.message) || '出了点问题', 'error');
-  return false;
+  if (e && e.code === 'auth') { auth.clear(); toast('请重新登录', 'error'); go('login'); return; }
+  const msg = (e && e.message) || '出了点问题';
+  if (errEl) errEl.textContent = msg; else toast(msg, 'error');
 }
-function signOut(local = false) {
-  if (!local) call('auth.logout').catch(() => {});
-  auth.clear();
-  store.set('sv.app.role', null);
-  cache = {};
-  store.set(CACHE_KEY, null);
-  S.role = null;
-  S.data = {};
-  S.ui.lastVisits = null;
-  go('welcome');
-}
-function signedIn(role, phone) {
-  S.role = role;
-  store.set('sv.app.role', role);
-  if (phone) store.set('sv.app.phone', phone);
-  S.data = {};
-  go(role === 'member' ? 'lobby' : 'status');
-}
-async function refreshLobbyBadge() {
-  if (S.data.lobby) { try { S.data.lobby = await get('lobby'); if (S.route === 'lobby') render(); } catch { /* ignore */ } }
-}
-async function checkInvite(code, quiet = false) {
-  code = String(code || '').trim().toUpperCase();
-  if (!code) { S.ui.inviteInfo = null; if (S.route === 'apply') render(); return; }
-  try {
-    S.ui.inviteInfo = await call('invite.check', { code });
-    S.ui.invite = code;
-    if (!quiet) toast(`${S.ui.inviteInfo.lead} 推荐了你`);
-  } catch (e) {
-    S.ui.inviteInfo = null;
-    if (!quiet) toast(e.message, 'error');
-  }
-  if (S.route === 'apply') render();
-}
-async function copyText(text) {
-  try { await navigator.clipboard.writeText(text); return true; } catch { /* fall back */ }
-  const ta = document.createElement('textarea');
-  ta.value = text;
-  ta.style.cssText = 'position:fixed;opacity:0';
-  document.body.appendChild(ta);
-  ta.select();
-  let ok = false;
-  try { ok = document.execCommand('copy'); } catch { /* ignore */ }
-  ta.remove();
-  return ok;
-}
-
 const ACTIONS = {
   'sheet-close': () => closeSheet(),
-  demo: async (d, el) => busy(el, async () => {
-    try {
-      const r = await call('auth.demo', { as: d.as });
-      auth.set(r.token);
-      signedIn(r.role, d.as === 'member' ? '13800000007' : '13900000021');
-    } catch (e) { handleError(e); }
-  }),
-  'send-code': (d, el) => {
-    const form = el.closest('form');
-    form.code.value = DEMO_CODE;
-    toast(`演示环境：验证码是 ${DEMO_CODE}，已为你填好`);
-    let n = 60;
-    el.disabled = true;
-    const t = setInterval(() => { n -= 1; el.textContent = n > 0 ? `${n} 秒` : '重新获取'; if (n <= 0) { clearInterval(t); el.disabled = false; } }, 1000);
-  },
-  'check-invite': (d, el) => checkInvite(el.closest('form').invite.value),
-  logout: () => { if (confirm('退出登录？')) signOut(); },
-  upgrade: async (d, el) => busy(el, async () => {
-    try {
-      await call('auth.upgrade');
-      S.role = 'member';
-      store.set('sv.app.role', 'member');
-      S.data = {};
-      S.ui.firstKey = true;
-      go('key');
-    } catch (e) { handleError(e); }
-  }),
   notices: async () => {
     openSheet('notices', { items: null });
-    try {
-      const items = await get('notices.list');
-      if (S.sheet && S.sheet.type === 'notices') { S.sheet.items = items; renderSheet(); }
-      if (items.some(n => !n.read)) { await call('notices.read'); refreshLobbyBadge(); }
-    } catch (e) { handleError(e); }
+    try { const items = await call('notices.list'); if (S.sheet && S.sheet.type === 'notices') { S.sheet.items = items; renderSheet(); } await call('notices.read'); S.me.unread = 0; } catch (e) { handleError(e); }
   },
-  concierge: async () => {
-    openSheet('concierge', { requests: null });
-    try {
-      const requests = await get('concierge.mine');
-      if (S.sheet && S.sheet.type === 'concierge') { S.sheet.requests = requests; renderSheet(); }
-    } catch (e) { handleError(e); }
+  fig: () => {
+    const t = Date.now();
+    S.ui.figTaps = [...S.ui.figTaps.filter(x => t - x < 2500), t];
+    if (S.ui.figTaps.length >= 5) { S.ui.figTaps = []; showDonut(); }
   },
-  reqtype: d => { S.ui.reqType = d.v; renderSheet(); },
+  'ev-filter': d => { S.ui.evFilter = d.v; render(); },
   event: d => openSheet('event', { id: d.id }),
-  rsvp: (d, el) => busy(el, async () => {
+  'event-register': (d, el) => busy(el, async () => {
+    try { await call('event.register', { id: d.id }); toast('已报名'); await refreshRoute(); renderSheet(); } catch (e) { handleError(e); }
+  }),
+  'event-cancel': (d, el) => busy(el, async () => {
+    try { await call('event.cancel', { id: d.id }); toast('已取消报名'); await refreshRoute(); renderSheet(); } catch (e) { handleError(e); }
+  }),
+  date: async d => { S.ui.session = d.id; S.ui.zone = null; await refreshRoute(); },
+  layout: d => { S.ui.layout = d.v; render(); },
+  zone: d => selectZone(d.id),
+  'book-zone': d => {
+    S.ui.zone = d.id; S.ui.extra = 0; S.ui.note = ''; S.ui.explanation = ''; S.ui.quote = null; S.ui.quoteErr = null;
+    const z = S.data.book.map.zones.find(x => x.id === d.id);
+    S.ui.party = Math.min(S.ui.party || 2, z.kind === 'booth' ? 30 : 4);
+    openSheet('booking');
+    requote();
+  },
+  party: d => { S.ui.party = Math.max(1, Math.min(40, S.ui.party + Number(d.d))); renderSheet(); requote(); },
+  extra: d => { S.ui.extra = Math.max(0, Math.min(2, S.ui.extra + Number(d.d))); renderSheet(); requote(); },
+  'book-submit': (d, el) => busy(el, async () => {
+    const map = S.data.book.map;
     try {
-      const e = await call('events.rsvp', { eventId: d.id });
-      patchEvent(e);
-      if (S.sheet) { S.sheet.admitted = e.mine; renderSheet(); }
-      navigator.vibrate?.(20);
-      refreshAfterChange();
+      const b = await call('booking.create', { session_id: map.session.id, zone: S.ui.zone, party_size: S.ui.party, extra: S.ui.extra, note: S.ui.note, explanation: S.ui.explanation });
+      if (b.status === 'pending_payment') { S.sheet = null; openSheet('pay', { booking: b }); }
+      else { closeSheet(); go(`order/${b.id}`); }
+    } catch (e) {
+      S.ui.quoteErr = e.message + (e.rule ? `（${e.rule}）` : '');
+      renderSheet();
+      if (e.code === 'conflict') { toast('刚被订走，地图已刷新', 'error'); await refreshRoute(); }
+    }
+  }),
+  'pay-open': async d => { try { const b = await call('booking.get', { id: d.id }); openSheet('pay', { booking: b }); } catch (e) { handleError(e); } },
+  pay: (d, el) => busy(el, async () => {
+    try { const b = await call('booking.pay', { id: d.id }); closeSheet(); navigator.vibrate?.(20); go(`order/${b.id}`); toast(b.status === 'confirmed' ? '已交割 · 预订成功' : b.status === 'pending_confirm' ? '已付款 · 尽调中，等门店确认' : b.label.zh); } catch (e) { handleError(e); }
+  }),
+  'pay-cancel': (d, el) => busy(el, async () => { try { await call('booking.abandon', { id: d.id }); closeSheet(); toast('订单已取消，桌位已释放'); await refreshRoute(); } catch (e) { handleError(e); } }),
+  rebook: async d => {
+    const b = S.data.order;
+    S.ui.session = b.session.id;
+    S.ui.zone = b.suggestion_zone || b.zone;
+    S.ui.party = b.party_size;
+    go(`book?zone=${S.ui.zone}`);
+  },
+  flip: (d, el) => el.classList.toggle('is-flipped'),
+  ink: async (d, el) => { const r = await trigger('ink'); if (r) el.classList.add('is-shown'); },
+  borrow: (d, el) => busy(el, async () => { try { await call('shelf.borrow', { id: d.id }); toast('借好了，记在你的书单上'); await refreshRoute(); } catch (e) { handleError(e); } }),
+  checkin: async () => {
+    openSheet('checkin', { status: null, code: '', companions: 0 });
+    try { const status = await call('checkin.today'); if (S.sheet && S.sheet.type === 'checkin') { S.sheet.status = status; renderSheet(); } } catch (e) { handleError(e); }
+  },
+  'ci-fill': () => { S.sheet.code = S.sheet.status.demo_code; renderSheet(); },
+  'ci-comp': d => { S.sheet.companions = Math.max(0, Math.min(20, (S.sheet.companions || 0) + Number(d.d))); renderSheet(); },
+  'ci-submit': (d, el) => busy(el, async () => {
+    try {
+      const r = await call('checkin.submit', { code: S.sheet.code, companions: S.sheet.companions || 0 });
+      const status = await call('checkin.today').catch(() => S.sheet.status);
+      S.sheet.result = r; S.sheet.status = status; renderSheet(); navigator.vibrate?.(30);
+      await refreshMe();
+      if (S.route === 'home') refreshRoute();
     } catch (e) { handleError(e); }
   }),
-  unrsvp: (d, el) => busy(el, async () => {
-    if (!confirm('确定取消吗？')) return;
-    try {
-      const e = await call('events.cancel', { eventId: d.id });
-      patchEvent(e);
-      if (S.sheet) { S.sheet.admitted = null; renderSheet(); }
-      toast('已取消');
-      refreshAfterChange();
-    } catch (e) { handleError(e); }
-  }),
-  filter: d => { S.ui.filter = d.v; render(); },
-  flip: () => { const c = $('.mcard'); if (c) c.classList.toggle('is-flipped'); },
-  tilt: async () => {
-    try { const r = await DeviceOrientationEvent.requestPermission(); if (r !== 'granted') toast('没有获得陀螺仪权限'); } catch { toast('这台设备不支持'); }
+  'meeting-new': () => openSheet('meeting', {}),
+  'meeting-respond': (d, el) => busy(el, async () => { try { await call('meeting.respond', { id: d.id, accept: d.v === '1' }); toast('已确认新的时间'); await refreshRoute(); } catch (e) { handleError(e); } }),
+  persona: async (d, el) => {
+    try { const r = await call('auth.demo', { as: d.v }); auth.set(r.token); overlayEl.dataset.played = ''; S.data = {}; toast(`已切换：${el.textContent.trim()}`); home(); } catch (e) { handleError(e); }
   },
-  floor: d => { S.ui.floor = d.floor; render(); },
-  date: async d => {
-    S.ui.date = d.date;
-    try { S.data.reserve = await loadReserve(); render(); } catch (e) { handleError(e); }
+  clock: async d => {
+    const v = d.v;
+    const args = v === 'real' ? { action: 'real' } : v.startsWith('+') ? { action: 'plus', minutes: Number(v.slice(1)) } : { action: 'set', hhmm: v };
+    try { const r = await call('demo.clock', args); toast(`演示时钟 → ${fmt.time(r.now)} · ${r.mode}`); await refreshRoute(); } catch (e) { handleError(e); }
   },
-  session: () => { S.ui.session = S.ui.session === 'day' ? 'night' : 'day'; render(); },
-  zone: (d, el) => {
-    if (el.classList.contains('is-full')) { toast('这个区域在该时段已经订满了'); return; }
-    S.ui.zone = d.zone;
-    render();
-    requestAnimationFrame(() => $('.zonecard')?.scrollIntoView({ behavior: reduceMotion() ? 'auto' : 'smooth', block: 'nearest' }));
-  },
-  party: d => { S.ui.party = Math.max(1, Math.min(4, S.ui.party + Number(d.d))); render(); },
-  book: (d, el) => reserveBook(d, el),
-  spine: d => openSheet('book', { id: d.id }),
-  hold: (d, el) => busy(el, async () => {
-    try { const b = await call('books.hold', { id: d.id }); patchBook(b); toast(`《${b.title}》已为你预留`); } catch (e) { handleError(e); }
-  }),
-  release: (d, el) => busy(el, async () => {
-    try { const b = await call('books.release', { id: d.id }); patchBook(b); toast('已取消预留'); } catch (e) { handleError(e); }
-  }),
-  nominate: () => openSheet('nominate', {}),
-  'copy-invite': async d => { toast(await copyText(d.text) ? '邀请已复制，发给对方吧' : '复制失败，请手动抄下邀请码', 'info'); },
-  theme: d => { store.set('sv.theme', d.v === 'auto' ? null : d.v); applyTheme(); render(); },
-  install: () => openSheet('install'),
-  'install-dismiss': () => { store.set('sv.install.dismissed', '1'); render(); },
-  'install-prompt': async () => {
-    if (!deferredInstall) return;
-    deferredInstall.prompt();
-    const choice = await deferredInstall.userChoice.catch(() => null);
-    deferredInstall = null;
-    if (choice && choice.outcome === 'accepted') { toast('已添加到桌面'); closeSheet(); }
-  },
-  about: () => openSheet('about'),
-  'reset-local': () => { if (confirm('重置这台设备上的演示数据？')) { localStorage.removeItem('sv.demo.db.v1'); localStorage.removeItem(CACHE_KEY); auth.clear(); location.hash = ''; location.reload(); } },
+  phosphor: d => { store.set('sv.phosphor', d.v === 'amber' ? null : d.v); applySkin(); render(); },
+  paper: d => { store.set('sv.paper', d.v === 'green' ? null : d.v); applySkin(); render(); },
+  renew: (d, el) => busy(el, async () => { if (!confirm(`续费 ${yuan(S.me.member_price)}（模拟支付）？`)) return; try { const r = await call('membership.renew'); toast(`续费成功，有效期至 ${fmt.date(r.end_at)}`); await refreshRoute(); } catch (e) { handleError(e); } }),
+  'app-pay': (d, el) => busy(el, async () => { try { await call('application.pay'); toast('欢迎入会'); S.data = {}; overlayEl.dataset.played = ''; home(); } catch (e) { handleError(e); } }),
+  claim: (d, el) => busy(el, async () => { try { await call('invite.claim', { token: d.id }); overlayEl.dataset.played = ''; S.data = {}; home(); } catch (e) { handleError(e); } }),
+  logout: async () => { try { await call('auth.logout'); } catch { /* ignore */ } auth.clear(); S.data = {}; home(); },
+  'unlock-skip': () => S.unlockFinish && S.unlockFinish(),
 };
-async function reserveBook(d, el) {
-  return busy(el, async () => {
-    const av = S.data.reserve.av;
-    const zone = av.sessions.find(s => s.id === S.ui.session).zones.find(z => z.id === S.ui.zone);
-    try {
-      const r = await call('reserve.create', { date: av.date, session: S.ui.session, zoneId: S.ui.zone, party: S.ui.session === 'day' && zone.unit === 'seat' ? 1 : S.ui.party, note: S.ui.note });
-      S.ui.note = '';
-      S.data.reserve = await loadReserve();
-      render();
-      openSheet('booked', { r });
-      navigator.vibrate?.(20);
-    } catch (e) { handleError(e); }
-  });
-}
-
-function patchEvent(e) {
-  if (S.data.programme) S.data.programme = S.data.programme.map(x => (x.id === e.id ? e : x));
-  else S.data.programme = [e];
-  if (S.route === 'programme') render();
-}
-function patchBook(b) {
-  if (S.data.stacks) S.data.stacks = S.data.stacks.map(x => (x.id === b.id ? b : x));
-  if (S.route === 'stacks') render();
-  renderSheet();
-}
-const refreshAfterChange = debounce(() => { S.data.lobby = null; S.data.me = null; }, 50);
 
 const FORMS = {
   login: async (form, fd) => {
     const err = $('[data-err]', form);
     err.textContent = '';
-    const btn = form.querySelector('button:not([type])');
-    await busy(btn, async () => {
-      try {
-        const r = await call('auth.login', { phone: fd.get('phone'), code: fd.get('code') });
-        auth.set(r.token);
-        signedIn(r.role, String(fd.get('phone')).replace(/\D/g, ''));
-      } catch (e) { handleError(e, err); }
-    });
+    try {
+      const r = await call('auth.login', { phone: fd.get('phone'), code: fd.get('code') });
+      auth.set(r.token);
+      overlayEl.dataset.played = '';
+      S.data = {};
+      go(S.params.next || 'home');
+    } catch (e) { handleError(e, err); }
   },
   apply: async (form, fd) => {
     const err = $('[data-err]', form);
     err.textContent = '';
-    const btn = form.querySelector('button:not([type])');
-    await busy(btn, async () => {
-      try {
-        const r = await call('apply', Object.fromEntries(fd));
-        auth.set(r.token);
-        toast('Received · 已收到。尽调进行中。');
-        S.ui.inviteInfo = null;
-        S.ui.invite = null;
-        signedIn('applicant', String(fd.get('phone')).replace(/\D/g, ''));
-      } catch (e) { handleError(e, err); }
-    });
+    try {
+      await call(S.me.application && S.me.application.status === 'need_info' ? 'application.update' : 'application.submit', Object.fromEntries(fd));
+      toast('已提交 · 尽调中');
+      go('me');
+    } catch (e) { handleError(e, err); }
   },
-  concierge: async (form, fd) => {
+  meeting: async (form, fd) => {
     const err = $('[data-err]', form);
-    const btn = form.querySelector('button:not([type])');
-    await busy(btn, async () => {
-      try {
-        await call('concierge.request', { type: S.ui.reqType, text: fd.get('text') });
-        S.ui.reqText = '';
-        const requests = await get('concierge.mine');
-        S.sheet = { type: 'concierge', sent: true, requests };
-        renderSheet();
-        toast('铃响了。我们很快回复你。');
-        S.data.me = null;
-      } catch (e) { handleError(e, err); }
-    });
-  },
-  nominate: async (form, fd) => {
-    const err = $('[data-err]', form);
-    const btn = form.querySelector('button:not([type])');
-    await busy(btn, async () => {
-      try {
-        const result = await call('referral.nominate', Object.fromEntries(fd));
-        S.sheet = { type: 'nominate', result };
-        renderSheet();
-        S.data.me = null;
-        if (S.route === 'me') route();
-      } catch (e) { handleError(e, err); }
-    });
+    try {
+      await call('meeting.create', Object.fromEntries(fd));
+      closeSheet(); toast('已提交，等门店回复');
+      await refreshRoute();
+    } catch (e) { handleError(e, err); S.sheet.v = Object.fromEntries(fd); }
   },
 };
 
@@ -1217,6 +908,7 @@ document.addEventListener('click', e => {
   if (!el || el.closest('[disabled]')) return;
   const fn = ACTIONS[el.dataset.act];
   if (!fn) return;
+  if (el.tagName === 'A' && el.getAttribute('href')) return;
   e.preventDefault();
   fn(el.dataset, el, e);
 });
@@ -1232,98 +924,52 @@ document.addEventListener('submit', e => {
 });
 document.addEventListener('input', e => {
   const el = e.target;
-  if (el.dataset.bind) {
-    S.ui[el.dataset.bind] = el.value;
-    if (el.dataset.live === 'stacks') renderStacksLive();
-  }
+  if (!el.dataset || !el.dataset.bind) return;
+  if (el.dataset.bind === 'ciCode') { S.sheet.code = el.value.toUpperCase(); return; }
+  S.ui[el.dataset.bind] = el.value;
+  if (S.sheet && S.sheet.type === 'booking') requote();
 });
-document.addEventListener('change', e => {
-  const radio = e.target.closest('.choice input[type="radio"]');
-  if (radio) radio.closest('.choice').querySelectorAll('.chip').forEach(c => c.classList.toggle('is-on', c.contains(radio)));
-});
-const renderStacksLive = debounce(() => {
-  const input = $('.search input');
-  const pos = input ? input.selectionStart : null;
-  render();
-  const again = $('.search input');
-  if (again) { again.focus(); if (pos != null) again.setSelectionRange(pos, pos); }
-}, 180);
+
+/* countdowns everywhere (pay locks, the 30-minute confirmation) */
+setInterval(() => {
+  const now = serverNow();
+  $$('[data-countdown]').forEach(el => {
+    const left = Math.max(0, Date.parse(el.dataset.countdown) - now);
+    el.textContent = `${pad(Math.floor(left / 60e3))}:${pad(Math.floor((left % 60e3) / 1e3))}`;
+    if (left === 0 && !el.dataset.fired) { el.dataset.fired = '1'; setTimeout(refreshRoute, 1500); }
+  });
+  $$('[data-ring]').forEach(el => {
+    const left = Math.max(0, Date.parse(el.dataset.ring) - now);
+    el.style.strokeDashoffset = String(188.5 * (1 - left / Number(el.dataset.span)));
+  });
+}, 1000);
 
 /* ---------- live updates ---------- */
-const refresh = debounce(async () => {
-  if (!S.role || !S.route) return;
-  const active = document.activeElement;
-  if (active && active.matches('input, textarea') && screenEl.contains(active)) { S.pending = true; return; }
-  const r = ROUTES[S.route];
-  const before = S.data[S.route];
+async function refreshRoute() {
+  const def = ROUTES[S.route];
+  if (!def) return;
   try {
-    if (r.load) {
-      const data = await r.load();
-      if (S.route === 'status' && before && data.application.stage !== before.application.stage) {
-        toast('你的申请有新进展');
-        navigator.vibrate?.([20, 60, 20]);
-      }
-      S.data[S.route] = data;
-      render();
-    }
-    if (S.sheet && S.sheet.type === 'event') { if (!S.data.programme || S.route !== 'programme') S.data.programme = await get('events.list'); renderSheet(); }
-    if (S.sheet && S.sheet.type === 'notices') { S.sheet.items = await get('notices.list'); renderSheet(); }
-    if (S.sheet && S.sheet.type === 'concierge') { S.sheet.requests = await get('concierge.mine'); renderSheet(); }
-  } catch (e) {
-    if (e.code === 'auth') handleError(e);
-  }
-}, 300);
-document.addEventListener('focusout', () => { if (S.pending) { S.pending = false; setTimeout(refresh, 50); } });
+    const [, data] = await Promise.all([refreshMe(), def.load ? def.load() : Promise.resolve(undefined)]);
+    if (def.load) S.data[S.route] = data;
+    const typing = document.activeElement && document.activeElement.matches('input, textarea, select') && screenEl.contains(document.activeElement);
+    if (!typing) render();
+    if (S.sheet && S.sheet.type === 'event') renderSheet();
+  } catch (e) { if (e.code === 'auth') handleError(e); }
+}
+const refresh = debounce(refreshRoute, 300);
 document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') refresh(); });
-
-/* ---------- theme & chrome ---------- */
-function applyTheme() {
-  const t = store.get('sv.theme');
-  if (t === 'light' || t === 'dark') document.documentElement.dataset.theme = t;
-  else delete document.documentElement.dataset.theme;
-  themeColor();
-}
-function themeColor() {
-  const t = store.get('sv.theme');
-  const dark = t === 'dark' || (t !== 'light' && matchMedia('(prefers-color-scheme: dark)').matches);
-  const color = S.route === 'key' ? '#7B1E3A' : S.route === 'welcome' ? (dark ? '#3A2127' : '#F7DCD8') : dark ? '#171110' : '#FBF4EA';
-  $('meta[name="theme-color"]').setAttribute('content', color);
-}
-matchMedia('(prefers-color-scheme: dark)').addEventListener?.('change', themeColor);
-
-function playIntro() {
-  const el = $('#intro');
-  let seen = false;
-  try { seen = sessionStorage.getItem('sv.intro') === '1'; sessionStorage.setItem('sv.intro', '1'); } catch { /* ignore */ }
-  if (seen || reduceMotion()) return;
-  el.hidden = false;
-  const done = () => { el.classList.add('is-out'); setTimeout(() => { el.hidden = true; }, 520); };
-  el.addEventListener('click', done, { once: true });
-  requestAnimationFrame(() => requestAnimationFrame(() => el.classList.add('is-go')));
-  setTimeout(done, 2300);
-}
+setInterval(async () => { // the house changes at 19:00 even if nobody touches anything
+  if (document.visibilityState !== 'visible' || !S.me) return;
+  try { const m = await call('me'); if (m.mode !== S.me.mode || m.identity !== S.me.identity) refresh(); } catch { /* offline */ }
+}, 30e3);
 
 /* ---------- boot ---------- */
 async function boot() {
-  applyTheme();
-  playIntro();
-  await connect({ tokenKey: 'sv.app.token' });
-  if (auth.token) {
-    try {
-      S.data.key = await get('me');
-      S.role = 'member';
-    } catch (e) {
-      if (e.code === 'forbidden') S.role = 'applicant';
-      else if (e.code === 'offline') S.role = store.get('sv.app.role') || ('me{}' in cache ? 'member' : null);
-      else auth.clear();
-    }
-  }
-  store.set('sv.app.role', S.role);
+  await connect({ tokenKey: 'sv.v2.token' });
+  try { await refreshMe(); } catch { auth.clear(); await refreshMe(); }
   onChange(() => refresh());
   addEventListener('hashchange', route);
   await route();
-  if ('serviceWorker' in navigator && location.protocol.startsWith('http')) {
-    navigator.serviceWorker.register('sw.js').catch(() => { /* not fatal */ });
-  }
+  if ('serviceWorker' in navigator && location.protocol.startsWith('http')) navigator.serviceWorker.register('sw.js').catch(() => {});
 }
 boot();
