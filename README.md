@@ -1,12 +1,48 @@
 # Something Ventured
 
+这个仓库里有三样东西：
+
+| | 地址 | 是什么 |
+| --- | --- | --- |
+| 官网 | `/` | 俱乐部官网：一部「六章的电影」 |
+| **会员端 Web App** | `/app/` | 可以「添加到主屏幕」的会员 App（PWA）：钥匙入场、节目、预订、藏书、推荐、按铃 |
+| **管理后台** | `/admin/` | 前台与运营后台：入场核验、入会申请、会员、节目、预订、藏书、礼宾、公告、楼层 |
+
+三者都是纯 HTML / CSS / JS，**没有任何依赖、没有构建步骤、不加载任何境外 CDN**（字体全部自托管），在大陆网络和微信内置浏览器里都能打开。会员端和后台共用一套数据与业务规则（`shared/core.js`），由一个零依赖的 Node 小服务器提供 API。
+
+## 快速开始
+
+```bash
+npm start
+```
+
+需要 Node 18 以上，不用 `npm install`。启动后打开：
+
+- 官网 <http://localhost:8080/>
+- 会员端 <http://localhost:8080/app/>（电脑上会显示在一个手机框里；手机连同一个 Wi-Fi，打开终端里打印的局域网地址）
+- 管理后台 <http://localhost:8080/admin/>
+
+| 演示账号 | 怎么进 |
+| --- | --- |
+| 会员 林知远 No.0007 | 会员端 →「我是会员」→「演示会员」，或手机号 `138 0000 0007` + 验证码 `2026` |
+| 申请人 宋予安（尽调中） | 「演示申请人」，或 `139 0000 0021` + `2026` |
+| 后台员工 | 任选一位，PIN `1215` |
+
+数据存在 `server/data/db.json`，`npm run reset` 恢复初始数据（后台侧栏也有「重置演示」）。`npm test` 跑一遍核心流程的冒烟测试。
+
+**没有服务器也能看**：把整个仓库放到任意静态托管上（或 `python3 -m http.server`），会员端和后台会自动切到「本地演示模式」，同一套规则在浏览器里运行，数据存在本机；同一浏览器里打开两个标签页，彼此实时同步。
+
+会员端与后台的完整说明（功能清单、架构、数据模型、接口、添加到主屏幕、上线清单、和小程序的关系）见 **[docs/web-app.md](docs/web-app.md)**。
+
+---
+
+## 官网
+
 Something Ventured 俱乐部官网：一部「六章的电影」。内容依据《Something Ventured 俱乐部介绍》（2026.10 内部同步版）。
 
 视觉上取对称构图、粉彩布景、章节标题卡和剖面布景（Wes Anderson 式的美感）；交互上用滚动驱动的镜头、翻页式时刻表、⌘K 礼宾台、实时合成的配乐，给 AI / VC / 机器人行业的人一点机械感和彩蛋。
 
-纯 HTML / CSS / JS，**没有任何依赖、没有构建步骤、不加载任何境外 CDN**（字体全部自托管），在大陆网络和微信内置浏览器里都能正常打开。
-
-## 本地预览
+## 本地预览（只看官网）
 
 ```bash
 python3 -m http.server 8000
@@ -53,13 +89,22 @@ python3 -m http.server 8000
 ## 文件
 
 ```
-index.html               全部结构与插画（SVG）
-assets/css/style.css     样式
-assets/js/main.js        场景、翻页牌、礼宾台、表单与会员卡
-assets/js/sound.js       配乐与音效（Web Audio）
-assets/fonts/            自托管字体
+index.html               官网：全部结构与插画（SVG）
+assets/css/style.css     官网样式
+assets/js/main.js        官网：场景、翻页牌、礼宾台、表单与会员卡
+assets/js/sound.js       官网：配乐与音效（Web Audio）
+assets/fonts/            自托管字体（官网与会员端共用）
 assets/img/              分享图与图标
-scripts/build-fonts.py   重新生成字体子集
+app/                     会员端 Web App（PWA）：index.html、app.css、app.js、manifest、service worker、图标
+admin/                   管理后台：index.html、admin.css、admin.js
+shared/core.js           数据模型、演示数据与全部业务规则（服务器与浏览器共用）
+shared/api.js            前端调用层：服务器模式 / 本地演示模式 / 离线
+shared/ui.js             模板、日期（杭州时间）、提示
+server/server.js         零依赖 Node 服务器：静态文件 + /api + 实时推送（SSE）
+scripts/build-fonts.py   重新生成字体子集（官网；--app 生成会员端与后台的子集）
+scripts/build-icons.mjs  渲染会员端图标与 iOS 启动图（需要 Playwright）
+scripts/smoke.mjs        核心流程冒烟测试（npm test）
+docs/web-app.md          会员端与后台说明
 ```
 
 ## 字体
@@ -78,6 +123,12 @@ scripts/build-fonts.py   重新生成字体子集
 pip install fonttools brotli
 mkdir -p /tmp/sv-fonts && (cd /tmp/sv-fonts && npm pack @fontsource/noto-serif-sc @fontsource-variable/source-serif-4 @fontsource-variable/jost @fontsource/ibm-plex-mono && for f in *.tgz; do mkdir -p "${f%.tgz}" && tar -xzf "$f" -C "${f%.tgz}"; done)
 python3 scripts/build-fonts.py /tmp/sv-fonts
+```
+
+会员端和后台的中文标题用另一份子集（`noto-serif-sc-600-app.woff2`），改了 `app/`、`admin/` 里的中文标题后运行：
+
+```bash
+python3 scripts/build-fonts.py --app /tmp/sv-fonts
 ```
 
 所有字体均为 SIL Open Font License。

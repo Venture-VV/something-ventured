@@ -1,0 +1,26 @@
+{
+  "id": "./",
+  "name": "Something Ventured",
+  "short_name": "Ventured",
+  "description": "Something Ventured 会员端：出示钥匙入场、预订 3F Library、报名节目、推荐同类。",
+  "lang": "zh-CN",
+  "dir": "ltr",
+  "start_url": "./#/lobby",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#7B1E3A",
+  "theme_color": "#9B2D4A",
+  "categories": ["lifestyle", "social"],
+  "icons": [
+    { "src": "icons/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "icons/icon-maskable-192.png", "sizes": "192x192", "type": "image/png", "purpose": "maskable" },
+    { "src": "icons/icon-maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ],
+  "shortcuts": [
+    { "name": "出示钥匙", "short_name": "钥匙", "url": "./#/key", "icons": [{ "src": "icons/icon-192.png", "sizes": "192x192" }] },
+    { "name": "预订座位", "short_name": "预订", "url": "./#/reserve", "icons": [{ "src": "icons/icon-192.png", "sizes": "192x192" }] },
+    { "name": "节目单", "short_name": "节目", "url": "./#/programme", "icons": [{ "src": "icons/icon-192.png", "sizes": "192x192" }] }
+  ]
+}
