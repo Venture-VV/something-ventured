@@ -1,0 +1,15 @@
+{
+  "name": "something-ventured",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Something Ventured — website, member web app (PWA) and back office demo",
+  "type": "module",
+  "scripts": {
+    "start": "node server/server.js",
+    "reset": "node server/server.js --reset",
+    "test": "node scripts/smoke.mjs"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
