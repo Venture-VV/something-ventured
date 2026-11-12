@@ -1,0 +1,10 @@
+# generated locally
+*.blend
+*.blend1
+renders/
+out/
+tripo/tasks.json
+tripo/images/
+assets/models/*
+!assets/models/.gitkeep
+__pycache__/
