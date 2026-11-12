@@ -6,9 +6,7 @@ from /assets/fonts. The Chinese serif (Noto Serif SC) is subset to exactly
 the characters that appear in index.html and main.js, which keeps it small.
 
 Re-run this whenever Chinese copy in index.html or main.js changes.
-The member app and the back office get their own subset (noto-serif-sc-600-app.woff2),
-built from app/, admin/ and shared/ (copy, floor plan, demo data):
-    python3 scripts/build-fonts.py --app /tmp/sv-fonts
+The member app and the back office use the phone's system fonts and need nothing here.
 
 
     pip install fonttools brotli
@@ -32,9 +30,6 @@ from fontTools.ttLib import TTFont
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 OUT = os.path.join(ROOT, "assets", "fonts")
 SOURCES = [os.path.join(ROOT, "index.html"), os.path.join(ROOT, "assets", "js", "main.js")]
-APP_SOURCES = [os.path.join(ROOT, p) for p in ("app/index.html", "app/app.js", "admin/index.html", "admin/admin.js", "shared/ui.js", "shared/core.js", "shared/plan.js")]
-# shared/core.js includes the demo data too (names, programme, content): names and titles are set in the serif
-CUT = {}
 
 CJK = re.compile(r"[　-〿㐀-䶿一-鿿＀-￯]")
 LATIN_UNICODES = (
@@ -55,8 +50,6 @@ def collect_cjk(sources=SOURCES):
     for path in sources:
         with open(path, encoding="utf-8") as fh:
             text = fh.read()
-        if path in CUT:
-            text = text.split(CUT[path])[0]
         chars.update(CJK.findall(text))
     # punctuation that copy edits are likely to introduce
     chars.update("，。、：；！？「」『』（）《》——…·")
@@ -142,16 +135,10 @@ def copy_mono(src, weight):
 
 
 def main():
-    args = [a for a in sys.argv[1:] if a != "--app"]
+    args = sys.argv[1:]
     if len(args) != 1:
         sys.exit(__doc__)
     src = args[0]
-    if "--app" in sys.argv:
-        text = collect_cjk(APP_SOURCES)
-        print(f"CJK characters in the app and back office: {len(text)}")
-        out = build_noto_serif_sc(src, 600, text, "noto-serif-sc-600-app.woff2")
-        print(f"  {os.path.relpath(out, ROOT)}  {os.path.getsize(out) / 1024:.1f} KB")
-        return
     os.makedirs(OUT, exist_ok=True)
     text = collect_cjk()
     print(f"CJK characters on the page: {len(text)}")
