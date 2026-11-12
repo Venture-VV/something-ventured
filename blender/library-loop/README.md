@@ -183,11 +183,9 @@ blender -b -P scripts/assemble.py -- --hero renders/hero --top renders/top --out
 
 去掉 `--top` 就是只有主画面的版本；加 `--loops 6` 直接导出循环 6 遍的一分钟版。
 
-### 给本地 AI 的一段话
+### 交给本地 AI
 
-可以直接贴给本地的 Claude Code / Cursor：
-
-> 读 `blender/library-loop/README.md`。按第 4 节依次执行：生成场景、检查 `assets/models/` 里有哪些 Tripo 模型并运行 `import_tripo.py`、各渲一帧 HERO 的第 1、62、173、277 帧给我看。雕像朝向或大小不对就调 `--yaw` / `--mirror` 或 SLOT 空物体上的 `target_height`。画面太亮或太暗只改 `build_scene.py` 顶部 CONFIG 和 `animate_hero` 里 bake 的倍数，不要改节奏。我确认后再渲 300 帧并运行 `assemble.py`。
+完整的任务书在 [`LOCAL_AI_PROMPT.md`](LOCAL_AI_PROMPT.md)，整段发给本地的 Claude Code / Cursor 即可。它包含环境检查、Tripo 生成（脚本或官方 CLI）、导入、调画面、渲染、出片六步，以及花钱和长时间渲染前必须先问你的规矩。
 
 ---
 
