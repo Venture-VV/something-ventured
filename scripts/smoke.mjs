@@ -2,6 +2,7 @@
    adapted to zone booking. Runs the same code the server and the browser's local mode run. */
 import assert from 'node:assert/strict';
 import { handle, seed, memberCode, checkinCode, methodNames, DEMO_CODE, DEMO_PIN } from '../shared/core.js';
+import { newPet, advance, act, statusOf, careOf, seenForms, normalize as normalizePet, TUNING } from '../shared/pet.js';
 
 const at = hhmm => Date.parse(`2026-11-07T${hhmm}:00+08:00`);
 let NOW = at('14:00');
@@ -238,5 +239,146 @@ fails(() => call(staff, 'admin.config.set', { key: 'userWithdrawEnabled', value:
 // demo clock
 assert.equal(call(null, 'demo.clock', { action: 'set', hhmm: '19:01' }).mode, 'night');
 call(null, 'demo.clock', { action: 'real' });
+
+
+/* ---------- the pet game: shared/pet.js ---------- */
+{
+  const HOUR = 3600e3;
+  const t0 = at('14:00') + 20 * 86400e3;
+  const born = () => { const p = newPet(t0); for (let i = 0; i < TUNING.hatchTaps; i++) act(p, 'warm', {}, t0); return p; };
+  /* look after a pet for some hours: feed, sweep, lights out when it is tired */
+  const tend = (p, from, hours, { read = 0, play = 0 } = {}) => {
+    for (let h = 1; h <= hours; h++) {
+      const now = from + h * HOUR;
+      advance(p, now);
+      if (p.stage === 'cocoon' || p.stage === 'adult' && hours > 200) continue;
+      if (p.asleep) { if (p.lamp) act(p, 'lamp', {}, now); continue; }
+      if (p.full < 60) act(p, 'feed', { food: 'page' }, now);
+      if (p.crumbs) act(p, 'clean', {}, now);
+      if (p.mood < 60) { for (let i = 0; i < 3; i++) act(p, 'stroke', {}, now); act(p, 'feed', { food: 'cookie' }, now); }
+      if (p.energy < 30) { act(p, 'lamp', {}, now); continue; }
+      if (read && h % read === 0) act(p, 'read', {}, now);
+      if (play && h % play === 0) act(p, 'play', { score: 12 }, now);
+    }
+    return from + hours * HOUR;
+  };
+
+  // P01: a closed book opens after a few taps; nothing else works before that
+  let p = newPet(t0);
+  assert.equal(act(p, 'feed', { food: 'page' }, t0).reason, 'na');
+  for (let i = 0; i < TUNING.hatchTaps - 1; i++) assert.equal(act(p, 'warm', {}, t0).hatched, false);
+  assert.equal(act(p, 'warm', {}, t0).hatched, true);
+  assert.equal(p.stage, 'baby');
+  act(p, 'name', { name: '  小 夜 <b>  ' }, t0);
+  assert.equal(p.name, '小 夜 <b>'.slice(0, 8));
+  ok('P01');
+
+  // P02: needs run down with time, even while the app is closed; crumbs pile up
+  p = born();
+  const before = { ...p };
+  const gone = advance(p, t0 + 6 * HOUR);
+  assert.equal(gone.minutes, 360);
+  assert.ok(p.full < before.full - 40 && p.mood < before.mood && p.energy < before.energy);
+  assert.equal(p.crumbs, 2);
+  assert.equal(statusOf(p).need, 'hungry');
+  assert.equal(advance(p, t0).minutes, 0); // a clock that goes back changes nothing
+  ok('P02');
+
+  // P03: meals and snacks
+  assert.equal(act(p, 'feed', { food: 'page' }, p.t).ok, true);
+  assert.equal(act(p, 'feed', { food: 'page' }, p.t).ok, true);
+  assert.equal(act(p, 'feed', { food: 'page' }, p.t).ok, true);
+  assert.equal(act(p, 'feed', { food: 'page' }, p.t).reason, 'full');
+  p.full = 40;
+  for (let i = 0; i < TUNING.snackLimit; i++) assert.equal(act(p, 'feed', { food: 'cookie' }, p.t).ok, true);
+  assert.equal(act(p, 'feed', { food: 'cookie' }, p.t).reason, 'snack_limit');
+  assert.equal(act(p, 'clean', {}, p.t).swept, 2);
+  assert.equal(act(p, 'clean', {}, p.t).reason, 'clean');
+  ok('P03');
+
+  // P04: lights out when it is tired; it wakes by itself and the lamp comes back on
+  p = born();
+  assert.equal(act(p, 'lamp', {}, t0).reason, 'not_sleepy');
+  p.energy = 20;
+  assert.equal(act(p, 'lamp', {}, t0).asleep, true);
+  assert.equal(act(p, 'feed', { food: 'page' }, t0).reason, 'asleep');
+  const night = advance(p, t0 + 7 * HOUR);
+  assert.ok(night.woke && !p.asleep && p.lamp && p.energy > 80);
+  p.energy = 1; p.full = 100;
+  advance(p, p.t + 30 * 60e3); // left alone, it nods off with the light on
+  assert.ok(p.asleep && p.lamp);
+  assert.equal(statusOf(p).need, 'lamp');
+  ok('P04');
+
+  // P05: left hungry for hours it falls ill; hot tea cures it
+  p = born();
+  const ill = advance(p, t0 + 20 * HOUR);
+  assert.ok(ill.sick && p.sick && p.neglect === 1);
+  assert.equal(act(p, 'read', {}, p.t).reason, p.asleep ? 'asleep' : 'sick');
+  assert.equal(act(p, 'tea', {}, p.t).ok, true);
+  assert.equal(act(p, 'tea', {}, p.t).reason, 'not_sick');
+  ok('P05');
+
+  // P06: neglected for days it hides in its book, and comes back when called
+  p = born();
+  const hid = advance(p, t0 + 4 * 86400e3);
+  assert.ok(hid.away && p.away);
+  const ageAway = p.age;
+  advance(p, t0 + 9 * 86400e3);
+  assert.equal(p.age, ageAway); // time stops for it
+  assert.equal(act(p, 'feed', { food: 'page' }, p.t).reason, 'away');
+  for (let i = 0; i < TUNING.callTaps - 1; i++) assert.equal(act(p, 'call', {}, p.t).back, false);
+  assert.equal(act(p, 'call', {}, p.t).back, true);
+  assert.ok(!p.away && p.full === 50);
+  ok('P06');
+
+  // P07: it grows — baby, young, cocoon, moth — and how it was raised decides which moth
+  const raise = opts => { const q = born(); let now = t0; now = tend(q, now, 23, opts); assert.equal(q.stage, 'baby'); now = tend(q, now, 2, opts); assert.equal(q.stage, 'teen'); now = tend(q, now, 48, opts); assert.equal(q.stage, 'cocoon'); tend(q, now, 6, opts); assert.equal(q.stage, 'adult'); return q; };
+  assert.equal(raise({ read: 4 }).form, 'scholar');
+  assert.equal(raise({ play: 4 }).form, 'musician');
+  const both = raise({ read: 5, play: 7 });
+  assert.equal(both.form, 'luna', `care ${careOf(both).toFixed(1)} know ${both.know} music ${both.music}`);
+  const left = born();
+  advance(left, t0 + 30 * HOUR); act(left, 'tea', {}, left.t); act(left, 'feed', { food: 'page' }, left.t);
+  advance(left, left.t + 30 * HOUR); act(left, 'tea', {}, left.t); act(left, 'feed', { food: 'page' }, left.t); act(left, 'feed', { food: 'page' }, left.t);
+  for (let i = 0; i < 40 && left.stage !== 'adult'; i++) { advance(left, left.t + HOUR); if (left.away) { for (let k = 0; k < TUNING.callTaps; k++) act(left, 'call', {}, left.t); } if (!left.asleep && left.full < 30) act(left, 'feed', { food: 'page' }, left.t); }
+  assert.equal(left.stage, 'adult');
+  assert.equal(left.form, 'dusty');
+  ok('P07');
+
+  // P08: gifts from the club, the mini-game, and letting a grown moth go
+  assert.equal(act(both, 'gift', { id: 'bk1', kind: 'ticket' }, both.t).kind, 'ticket');
+  assert.equal(act(both, 'gift', { id: 'bk1', kind: 'ticket' }, both.t).reason, 'claimed');
+  const played = act(both, 'play', { score: 23 }, both.t);
+  assert.ok(played.record && played.music === 5 && both.best === 23);
+  assert.deepEqual(seenForms(both), ['luna']);
+  both.name = '月月';
+  const gone2 = act(both, 'release', {}, both.t);
+  assert.equal(gone2.released.form, 'luna');
+  assert.ok(both.stage === 'book' && both.album.length === 1 && both.best === 23 && both.gifts.includes('bk1'));
+  assert.equal(act(born(), 'release', {}, t0).reason, 'na');
+  ok('P08');
+
+  // P09: only a well-formed save is accepted
+  assert.equal(normalizePet(null), null);
+  assert.equal(normalizePet({ v: 1, stage: 'dragon' }), null);
+  const odd = normalizePet({ ...born(), full: 9999, mood: 'x', name: '<script>alert(1)</script>', gifts: [1, 'ok', {}], album: [{ form: 'nope' }, { form: 'luna', name: 'A', days: 3, at: t0 }], extra: 'dropped' }, t0);
+  assert.ok(odd.full === 100 && odd.mood === 0 && !/[<>]/.test(odd.name) && odd.name.length <= 8 && odd.gifts.length === 1 && odd.album.length === 1 && !('extra' in odd));
+  ok('P09');
+
+  // P10: the save lives with the account; a stale copy does not overwrite a newer one
+  NOW = at('15:00') + 86400e3;
+  const seeded = call(lin, 'pet.load');
+  assert.ok(seeded && seeded.name === '墨墨' && seeded.stage === 'teen');
+  assert.equal(call(guest, 'pet.load'), null);
+  fails(() => call(guest, 'pet.save', { pet: { v: 9 } }), /存档/);
+  const mine = newPet(NOW); mine.rev = 3;
+  assert.equal(call(guest, 'pet.save', { pet: mine }).ok, true);
+  assert.equal(call(guest, 'pet.load').rev, 3);
+  const stale = call(guest, 'pet.save', { pet: { ...mine, rev: 2, name: '旧的' } });
+  assert.ok(stale.ok === false && stale.pet.rev === 3);
+  fails(() => call(null, 'pet.load'), /登录/);
+  ok('P10');
+}
 
 console.log(`ok · ${methodNames().length} methods · ${ran.length} acceptance cases: ${ran.join(' ')}`);

@@ -1,0 +1,54 @@
+/* =========================================================
+   书虫 · the toy
+   A pocket-size case the colour of a cloth-bound book, a strip of
+   grey-green glass, six rubber keys. The page around it stays as
+   plain as the rest of the app.
+   ========================================================= */
+.pet { max-width: 420px; margin: 0 auto; padding: 8px 16px 0; }
+.pet__dev { padding: 14px 14px 16px; border-radius: 22px; background: #2E5A4C; box-shadow: inset 0 0 0 1px rgba(255, 255, 255, .08), inset 0 -6px 0 rgba(0, 0, 0, .16), 0 6px 18px rgba(28, 28, 30, .14); }
+.pet__head { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; padding: 0 4px 10px; color: #fff; }
+.pet__head b { font-size: 17px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.pet__head span { flex: none; font-size: 12px; opacity: .75; }
+.pet__glass { display: grid; place-items: center; padding: 10px; border-radius: 12px; background: #1B2A24; box-shadow: inset 0 2px 6px rgba(0, 0, 0, .5); }
+.pet__lcd { display: block; max-width: 100%; border-radius: 4px; touch-action: manipulation; -webkit-tap-highlight-color: transparent; user-select: none; -webkit-user-select: none; cursor: pointer; box-shadow: inset 0 0 0 1px rgba(30, 42, 28, .25); }
+.pet__say { min-height: 40px; margin: 12px 4px 10px; color: #fff; font-size: 15px; line-height: 20px; text-align: center; }
+
+.pet__keys { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+.pkey { position: relative; display: grid; justify-items: center; gap: 4px; min-height: 62px; padding: 9px 4px 7px; border: 0; border-radius: 14px; background: #EFEBDD; color: #1E2A1C; font-size: 13px; line-height: 16px; box-shadow: 0 3px 0 #BDB7A1; -webkit-tap-highlight-color: transparent; touch-action: manipulation; }
+.pkey canvas { display: block; }
+.pkey:active { transform: translateY(2px); box-shadow: 0 1px 0 #BDB7A1; }
+.pkey--wide { grid-column: span 2; }
+.pkey--wide:only-child { grid-column: 1 / -1; }
+.pkey.is-need { background: #FFE9A8; box-shadow: 0 3px 0 #D2B75F; }
+.pkey.is-need::after { content: ""; position: absolute; top: 7px; right: 9px; width: 7px; height: 7px; border-radius: 50%; background: #C8452E; animation: pet-blink 1s steps(2, start) infinite; }
+@keyframes pet-blink { to { visibility: hidden; } }
+.pet__wait { grid-column: 1 / -1; margin: 0; padding: 14px 8px; color: rgba(255, 255, 255, .85); font-size: 14px; text-align: center; }
+
+.pet__under { display: grid; gap: 10px; margin-top: 14px; }
+.pet__gift { display: grid; gap: 2px; padding: 12px 14px; border: 1px solid #E3C766; border-radius: 12px; background: #FFF6D6; color: var(--text); text-align: left; }
+.pet__gift b { font-size: 15px; }
+.pet__gift small { font-size: 13px; color: var(--text-2); }
+.pet__hint { margin: -2px 2px 0; font-size: 13px; color: var(--text-2); }
+.pet__more { justify-self: center; min-height: 40px; padding: 0 12px; border: 0; background: none; color: var(--text-2); font-size: 14px; text-decoration: underline; }
+
+.pet__h { margin: 20px 0 10px; font-size: 15px; }
+.pet__h:first-child { margin-top: 0; }
+.pet__h small { margin-left: 6px; font-size: 12px; font-weight: 400; color: var(--text-3); }
+.pet__album { display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; }
+.pet__tile { display: grid; justify-items: center; gap: 2px; padding: 10px 8px; border: 1px solid var(--line); border-radius: 12px; background: var(--card); text-align: center; }
+.pet__tile canvas { border-radius: 4px; margin-bottom: 4px; }
+.pet__tile b { font-size: 14px; }
+.pet__tile small { font-size: 12px; line-height: 16px; color: var(--text-3); }
+.pet__rules { margin: 0; padding-left: 18px; font-size: 14px; line-height: 22px; color: var(--text-2); }
+.pet__rules li + li { margin-top: 4px; }
+
+/* the way in, on 「我的」 */
+.petcard { display: flex; align-items: center; gap: 12px; width: 100%; padding: 12px 14px; border: 1px solid var(--line); border-radius: 12px; background: var(--card); color: var(--text); text-align: left; text-decoration: none; }
+.petcard canvas { flex: none; border-radius: 6px; }
+.petcard__main { flex: 1; min-width: 0; display: grid; gap: 2px; }
+.petcard__main b { font-size: 16px; }
+.petcard__main small { font-size: 13px; color: var(--text-2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.petcard__dot { flex: none; width: 8px; height: 8px; border-radius: 50%; background: var(--danger); }
+.petcard svg { flex: none; width: 18px; height: 18px; color: var(--text-3); }
+
+@media (prefers-reduced-motion: reduce) { .pkey.is-need::after { animation: none; } }

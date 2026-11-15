@@ -7,6 +7,7 @@ import { connect, call, auth, onChange } from '../shared/api.js';
 import { html, raw, fmt, toast, debounce, initialOf } from '../shared/ui.js';
 import { yuan, hz, hzDate, daysBetween } from '../shared/core.js';
 import { zoneOf, planSVG } from '../shared/plan.js';
+import { advance as petAdvance, statusOf as petStatus, titleOf as petTitle, normalize as petNormalize } from '../shared/pet.js';
 
 const $ = (s, el = document) => el.querySelector(s);
 const viewEl = $('#view');
@@ -61,6 +62,7 @@ const ROUTES = {
   me: { tab: 'me', title: '我的', load: loadMe, view: viewMe },
   login: { title: '登录', view: viewLogin },
   invite: { title: '会员邀请', load: () => call('invite.view', { token: S.id }), view: viewInvite },
+  pet: { title: '书虫', user: true, load: loadPet, view: viewPet },
 };
 
 async function route() {
@@ -73,7 +75,7 @@ async function route() {
   S.id = id ? decodeURIComponent(id) : '';
   S.query = Object.fromEntries(new URLSearchParams(qs || ''));
   if (def.user && !user()) { location.replace(loginHref(location.hash.replace(/^#\/?/, ''))); return; }
-  if (changed) { S.data = null; closeSheet(); if (name !== 'invite') S.ui.claimed = null; }
+  if (changed) { S.data = null; closeSheet(); leavePet(); if (name !== 'invite') S.ui.claimed = null; }
   document.title = `${def.title} · library live`;
   await load(changed);
 }
@@ -345,8 +347,8 @@ function viewTalk(e) {
 /* ---------- me ---------- */
 async function loadMe() {
   if (!user()) return {};
-  const [orders, events] = await Promise.all([call('bookings.mine'), call('events.list')]);
-  return { orders, talks: events.filter(e => e.kind === 'roundtable' && ['registered', 'attended'].includes(e.mine) && !e.past) };
+  const [orders, events, pet] = await Promise.all([call('bookings.mine'), call('events.list'), call('pet.load').catch(() => null)]);
+  return { orders, pet, talks: events.filter(e => e.kind === 'roundtable' && ['registered', 'attended'].includes(e.mine) && !e.past) };
 }
 function memberBlock() {
   const me = S.me;
@@ -372,6 +374,7 @@ function viewMe(d) {
       <div class="profile"><span class="avatar">${initialOf(me.user.name || me.user.phone)}</span><div><h2>${me.user.name || '新用户'}</h2><p>${me.user.phone}${me.user.name ? '' : html` · <button class="link" data-act="set-name" style="padding:0">填写称呼</button>`}</p></div></div>
       ${memberBlock()}
     </div></section>
+    <section class="section">${petCard(d.pet)}</section>
     <section class="section"><div class="section__h"><h2>我的预订</h2>${orders.length > 3 ? html`<a href="#/orders">全部</a>` : ''}</div>
       <div class="list">${orders.length ? orders.slice(0, 3).map(orderRow) : html`<div class="empty">还没有预订<br><a class="btn btn--sm" href="#/book">去订座</a></div>`}</div></section>
     <section class="section"><div class="section__h"><h2>我报名的座谈</h2></div>
@@ -383,6 +386,53 @@ function viewMe(d) {
     </div></section>
     <button class="demo-link" data-act="demo">演示工具</button>`;
 }
+
+/* ---------- 书虫：a small pet that lives in a book ---------- */
+let petMod = null;
+function leavePet() { if (petMod) petMod.unmount(); }
+/* the newest copy of the pet: the one the server keeps, or the one on this phone if it is ahead */
+function petNow(saved) {
+  const now = serverNow();
+  let p = saved ? petNormalize(saved, now) : null;
+  try {
+    const c = petNormalize(JSON.parse(localStorage.getItem(`sv.pet.${user().id}`) || 'null'), now);
+    if (c && (!p || c.rev > p.rev)) p = c;
+  } catch { /* nothing kept on this phone */ }
+  if (p) petAdvance(p, now);
+  return p;
+}
+function petCard(saved) {
+  const p = petNow(saved);
+  S.ui.petSpec = p ? { stage: p.stage, form: p.form, away: p.away } : { stage: 'book' };
+  const st = p ? petStatus(p) : null;
+  const title = !p || p.stage === 'book' ? '书虫' : `${p.name || '小书虫'} · ${petTitle(p)}`;
+  const line = !p ? '一本合着的书，敲敲看里面住着谁' : p.name ? st.text.replace('它', p.name) : st.text;
+  return html`<a class="petcard" href="#/pet"><canvas data-petthumb width="60" height="45"></canvas>
+    <span class="petcard__main"><b>${title}</b><small>${line}</small></span>
+    ${st && st.alert && p.stage !== 'book' ? html`<span class="petcard__dot" aria-label="需要照顾"></span>` : ''}<svg aria-hidden="true"><use href="#i-right"/></svg></a>`;
+}
+ROUTES.me.after = () => {
+  const c = $('[data-petthumb]');
+  if (c) import('./pet/index.js').then(m => { petMod = m; if (c.isConnected) m.paintPet(c, S.ui.petSpec || { stage: 'book' }, { pitch: 2, w: 30, h: 22 }); }).catch(() => {});
+};
+async function loadPet() {
+  const [mod, saved, orders, events] = await Promise.all([import('./pet/index.js'), call('pet.load'), call('bookings.mine').catch(() => []), call('events.list').catch(() => [])]);
+  petMod = mod;
+  // what happens in the real club reaches the pet: a booked night, a roundtable
+  const gifts = [
+    ...orders.filter(b => ['confirmed', 'fulfilled'].includes(b.status)).map(b => ({ id: `b:${b.id}`, kind: 'ticket', label: `${md(b.date)}的预订` })),
+    ...events.filter(e => e.kind === 'roundtable' && ['registered', 'attended'].includes(e.mine)).map(e => ({ id: `e:${e.id}`, kind: 'note', label: `座谈「${e.title}」` })),
+  ];
+  return { saved, gifts };
+}
+function viewPet() {
+  return html`${top('书虫', 'me')}<div id="pet-host"></div>`;
+}
+ROUTES.pet.after = () => {
+  const host = $('#pet-host');
+  if (!host || !petMod) return;
+  petMod.mount(host, { saved: S.data.saved, gifts: S.data.gifts, now: serverNow, uid: user().id, openSheet, closeSheet, demo: true });
+};
 
 /* ---------- login ---------- */
 const PERSONAS = [['member', '会员 林知远'], ['non_member', '非会员 陈一'], ['invitee', '受邀人 向南'], ['expired', '会员已到期 唐晚']];
@@ -671,7 +721,7 @@ const refresh = debounce(async () => {
   if (a && a.matches('input, textarea') && viewEl.contains(a)) return;
   if (S.sheet && S.route !== 'book') return;
   try { await refreshMe(); } catch { /* offline */ }
-  if (S.route === 'booking') return; // don't move the form under the guest's fingers
+  if (S.route === 'booking' || S.route === 'pet') return; // don't move the form (or the pet) under the guest's fingers
   load(false);
 }, 400);
 
