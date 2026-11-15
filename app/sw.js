@@ -2,10 +2,11 @@
    - app shell: network first, cached copy when offline (so updates land on the next open)
    - images: cache first
    - the API is never cached */
-const VERSION = 'sv-app-v3';
+const VERSION = 'sv-app-v4';
 const SHELL = [
   './', './index.html', './app.css', './app.js', './manifest.webmanifest',
   '../shared/core.js', '../shared/api.js', '../shared/ui.js', '../shared/plan.js', '../shared/plan.css',
+  '../shared/pet.js', './pet/index.js', './pet/scene.js', './pet/lcd.js', './pet/sound.js', './pet/pet.css',
   './icons/icon-192.png', './icons/apple-touch-icon.png', '../assets/img/favicon.svg',
 ];
 

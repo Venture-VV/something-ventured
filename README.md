@@ -5,7 +5,7 @@
 | | 地址 | 是什么 |
 | --- | --- | --- |
 | 官网 | `/` | 俱乐部官网：一部「六章的电影」 |
-| **会员端 Web App** | `/app/` | library live 的会员 App（PWA，可「添加到主屏幕」），最小可用版：按区域订座、白天座谈报名、领取会员邀请 |
+| **会员端 Web App** | `/app/` | library live 的会员 App（PWA，可「添加到主屏幕」），最小可用版：按区域订座、白天座谈报名、领取会员邀请；「我的」里有一只点阵屏电子宠物「书虫」 |
 | **管理后台** | `/admin/` | 门店后台：确认订单并安排桌号、入场核验、管理座谈和报名、发出会员邀请 |
 
 三者都是纯 HTML / CSS / JS，**没有任何依赖、没有构建步骤、不加载任何境外 CDN**（官网字体自托管，会员端和后台用系统字体），在大陆网络和微信内置浏览器里都能打开。会员端和后台共用一套数据与业务规则（`shared/core.js`，依据《执行规格 v0.3》与 v0.3 新规则），由一个零依赖的 Node 小服务器提供 API。
@@ -96,9 +96,11 @@ assets/js/sound.js       官网：配乐与音效（Web Audio）
 assets/fonts/            官网的自托管字体
 assets/img/              分享图与图标
 app/                     会员端 Web App（PWA）：index.html、app.css、app.js、manifest、service worker、图标
+app/pet/                 电子宠物「书虫」：点阵屏和像素图（lcd.js）、动画与小游戏（scene.js）、蜂鸣器音效（sound.js）、页面（index.js、pet.css）
 admin/                   管理后台：index.html、admin.css、admin.js
 shared/core.js           数据模型、演示数据与全部业务规则（服务器与浏览器共用）
 shared/plan.js           店内平面图：分区、桌位、容量和价档
+shared/pet.js            电子宠物的规则：按时间推演的养成模拟（服务器与浏览器共用）
 shared/plan.css          平面图的样式
 shared/api.js            前端调用层：服务器模式 / 本地演示模式 / 离线
 shared/ui.js             模板、日期（杭州时间）、提示

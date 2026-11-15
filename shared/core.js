@@ -11,8 +11,9 @@
    Money is integer fen. Times are stored UTC; business time is Asia/Shanghai.
    ========================================================= */
 import { ZONES, RESOURCES, zoneOf, resourceOf } from './plan.js';
+import { newPet, normalize as normalizePet } from './pet.js';
 
-export const VERSION = 2;
+export const VERSION = 3;
 export const DEMO_CODE = '2026';
 export const DEMO_PIN = '1215';
 export const RULES_VERSION = 'v0.3';
@@ -266,6 +267,7 @@ export function seed(t = Date.now()) {
     sessions: [], bookings: [], occupancies: [], holds: [], tickets: [], redemptions: [],
     checkins: [], checkinOverrides: {}, meetings: [], events: [], registrations: [],
     content: contentSeed(), unlocks: [], shelf: [], notices: [], audit: [], tokens: {}, nextNo: 1,
+    pets: {},
   };
   const addUser = (name, en, phone, extra = {}) => {
     const u = { id: 'u' + phone, name, en, phone, city: extra.city || '杭州', company_role: extra.venture || '', intro: '', member_no: null, unlock_seen: false, secret: 'sv-m-' + phone, created_at: extra.created_at || ago(40), notices_seen_at: '' };
@@ -446,6 +448,11 @@ export function seed(t = Date.now()) {
   note(visitor, 'refund', '退款已到账', `${yuan(rp.amount)} 已原路退回。`, ago(1, 22), false);
   note(visitor, 'booking', '本轮未进 · 门店未接受', '那晚墙边卡座已被包场。可以改订沙龙沙发，或者第二天的墙边卡座。', ago(2), true);
   db.audit.push({ id: 'au' + rid(6), actor: 'st1', action: 'booking.reject', object_type: 'booking', object_id: rej.id, reason: '那晚墙边卡座已被包场。', at: ago(2) });
+  // one bookworm is already a few days old, so the game has something to show
+  db.pets[lin.id] = Object.assign(newPet(t), {
+    name: '墨墨', stage: 'teen', born: t - 50 * H, age: 50 * 60, full: 58, mood: 72, energy: 64, crumbs: 1, crumbT: 40,
+    know: 8, music: 5, careSum: 68 * 2400, careN: 2400,
+  });
   return db;
 }
 function structuredCopy(v) { return JSON.parse(JSON.stringify(v)); }
@@ -826,6 +833,18 @@ def('profile.update', 'user', (ctx, { name }) => {
   ctx.user.name = n;
   ctx.touch('members');
   return { name: n };
+});
+/* the pet game keeps its save with the account, so the bookworm is the same on every phone */
+def('pet.load', 'user', ctx => (ctx.db.pets && ctx.db.pets[ctx.user.id]) || null);
+def('pet.save', 'user', (ctx, { pet }) => {
+  const p = normalizePet(pet, ctx.now);
+  if (!p) fail('存档格式不对');
+  if (!ctx.db.pets) ctx.db.pets = {};
+  const cur = ctx.db.pets[ctx.user.id];
+  if (cur && cur.rev > p.rev) return { ok: false, pet: cur }; // another phone is ahead: it wins
+  ctx.db.pets[ctx.user.id] = p;
+  ctx.touch('session'); // keep it, quietly: nobody else needs to hear about it
+  return { ok: true, pet: p };
 });
 def('unlock.seen', 'user', ctx => { ctx.user.unlock_seen = true; ctx.touch('session'); return { ok: true }; });
 
